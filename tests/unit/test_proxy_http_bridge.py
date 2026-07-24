@@ -17414,11 +17414,13 @@ async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_pre
 )
 async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_when_owner_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     unsafe_replay_input: str | None,
     replace_retired_gate: bool,
     stored_model: str | None,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    caplog.set_level(logging.INFO, logger="app.modules.proxy.service")
     account_neutral_classifier = Mock(
         wraps=http_bridge_streaming_module._http_bridge_payload_is_account_neutral_fresh_replay
     )
@@ -17666,9 +17668,15 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         assert exc_info.value is owner_unavailable
         assert get_or_create.await_count == 1
         if unsafe_replay_input == "conversation":
+            assert "http_bridge_event event=fresh_reattach_replay_rejected" not in caplog.text
             last_call = get_or_create.await_args
             assert last_call is not None
             assert last_call.kwargs["previous_response_id"] is None
+        else:
+            assert "http_bridge_event event=fresh_reattach_replay_rejected" in caplog.text
+            assert "proxy_injected=True" in caplog.text
+        if unsafe_replay_input == "file":
+            assert "reason=account_bound_payload" in caplog.text
         if unsafe_replay_input in {"missing_prior_output", "orphan_output"}:
             account_neutral_classifier.assert_not_called()
         else:
@@ -17678,6 +17686,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     chunks = [chunk async for chunk in stream]
 
     assert chunks == ['data: {"type":"response.completed"}\n\n']
+    assert "http_bridge_event event=fresh_reattach_replay_rejected" not in caplog.text
     if preprojected_fresh_reattach:
         assert get_or_create.await_count == 2
         first_call = get_or_create.await_args_list[0]

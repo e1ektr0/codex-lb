@@ -19,6 +19,8 @@ eventually retires the request.
   without `previous_response_id` when the anchored attempt remains eventless.
 - Keep unsafe, owner-bound, or incomplete continuation payloads fail-closed and
   preserve the existing no-replay rule after ambiguous delivery.
+- Emit a payload-free reason code when replay-safety checks reject fresh
+  reattach recovery.
 - Tie the startup first-item probe to the ASGI response lifecycle so teardown
   closes the source even when body iteration never begins.
 

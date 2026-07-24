@@ -917,6 +917,7 @@ class _HTTPBridgeStreamingMixin:
         durable_full_resend_fresh_payload: ResponsesRequest | None = None
         durable_full_resend_is_account_neutral: bool | None = None
         durable_full_resend_retains_prior_output = False
+        durable_full_resend_replay_rejection_reason: str | None = None
         force_local_recovery_creation = False
         live_local_session_exists = False
         forwards_to_active_owner = False
@@ -1170,23 +1171,31 @@ class _HTTPBridgeStreamingMixin:
         def durable_full_resend_allows_account_neutral_replay() -> bool:
             nonlocal durable_full_resend_fresh_payload
             nonlocal durable_full_resend_is_account_neutral
+            nonlocal durable_full_resend_replay_rejection_reason
             nonlocal durable_full_resend_retains_prior_output
 
-            if (
-                forwarded_request
-                or rewritten_file_account_id is not None
-                or durable_full_resend_anchor_count is None
-                or durable_full_resend_anchor_fingerprint is None
-            ):
+            if forwarded_request:
+                durable_full_resend_replay_rejection_reason = "forwarded_request"
+                return False
+            if rewritten_file_account_id is not None:
+                durable_full_resend_replay_rejection_reason = "file_owner_bound"
+                return False
+            if durable_full_resend_anchor_count is None:
+                durable_full_resend_replay_rejection_reason = "missing_stored_count"
+                return False
+            if durable_full_resend_anchor_fingerprint is None:
+                durable_full_resend_replay_rejection_reason = "missing_stored_fingerprint"
                 return False
             if durable_full_resend_fresh_payload is None:
                 if not isinstance(payload.input, list):
+                    durable_full_resend_replay_rejection_reason = "input_not_list"
                     return False
                 replay_projection = project_responses_input_for_account_neutral_fresh_replay(
                     cast(list[JsonValue], payload.input),
                     stored_count=durable_full_resend_anchor_count,
                 )
                 if replay_projection is None:
+                    durable_full_resend_replay_rejection_reason = "unsafe_input_projection"
                     return False
                 durable_full_resend_fresh_payload = _http_bridge_payload_without_previous_response_id(
                     payload
@@ -1196,12 +1205,17 @@ class _HTTPBridgeStreamingMixin:
                     stored_count=replay_projection.stored_prefix_count,
                 )
             if not durable_full_resend_retains_prior_output:
+                durable_full_resend_replay_rejection_reason = "prior_output_not_retained"
                 return False
             if durable_full_resend_is_account_neutral is None:
                 durable_full_resend_is_account_neutral = _http_bridge_payload_is_account_neutral_fresh_replay(
                     durable_full_resend_fresh_payload
                 )
-            return durable_full_resend_is_account_neutral
+            if not durable_full_resend_is_account_neutral:
+                durable_full_resend_replay_rejection_reason = "account_bound_payload"
+                return False
+            durable_full_resend_replay_rejection_reason = None
+            return True
 
         def owner_unavailable_allows_account_neutral_replay(exc: ProxyResponseError) -> bool:
             return (
@@ -1296,30 +1310,44 @@ class _HTTPBridgeStreamingMixin:
             and not forwards_to_active_owner
             and request_state.previous_response_id is not None
         )
-        if fresh_bridge_durable_reattach and durable_full_resend_allows_account_neutral_replay():
-            if proxy_injected_previous_response_id:
-                switch_to_account_neutral_replay(
-                    event_name="fresh_reattach_anchor_projected",
-                    detail="outcome=projected_before_first_fresh_bridge_send",
-                    exclude_current_owner=False,
-                )
+        if fresh_bridge_durable_reattach:
+            if durable_full_resend_allows_account_neutral_replay():
+                if proxy_injected_previous_response_id:
+                    switch_to_account_neutral_replay(
+                        event_name="fresh_reattach_anchor_projected",
+                        detail="outcome=projected_before_first_fresh_bridge_send",
+                        exclude_current_owner=False,
+                    )
+                else:
+                    fresh_payload = durable_full_resend_fresh_payload
+                    if fresh_payload is None:
+                        raise RuntimeError("fresh reattach projection missing after eligibility check")
+                    _fresh_request_state, fresh_request_text = prepare_bridge_request(fresh_payload)
+                    del _fresh_request_state
+                    request_state.fresh_upstream_request_text = fresh_request_text
+                    request_state.fresh_upstream_request_is_retry_safe = True
+                    request_state.fresh_bridge_reattach_startup_timeout_seconds = (
+                        _HTTP_BRIDGE_FRESH_REATTACH_RESPONSE_CREATED_MAX_SECONDS
+                    )
+                    _log_http_bridge_event(
+                        "fresh_reattach_anchor_retry_armed",
+                        bridge_session_key,
+                        account_id=request_state.preferred_account_id,
+                        model=payload.model,
+                        detail="outcome=bounded_single_anchorless_retry",
+                        cache_key_family=bridge_session_key.affinity_kind,
+                        model_class=_extract_model_class(payload.model) if payload.model else None,
+                    )
             else:
-                fresh_payload = durable_full_resend_fresh_payload
-                if fresh_payload is None:
-                    raise RuntimeError("fresh reattach projection missing after eligibility check")
-                _fresh_request_state, fresh_request_text = prepare_bridge_request(fresh_payload)
-                del _fresh_request_state
-                request_state.fresh_upstream_request_text = fresh_request_text
-                request_state.fresh_upstream_request_is_retry_safe = True
-                request_state.fresh_bridge_reattach_startup_timeout_seconds = (
-                    _HTTP_BRIDGE_FRESH_REATTACH_RESPONSE_CREATED_MAX_SECONDS
-                )
                 _log_http_bridge_event(
-                    "fresh_reattach_anchor_retry_armed",
+                    "fresh_reattach_replay_rejected",
                     bridge_session_key,
-                    account_id=request_state.preferred_account_id,
+                    account_id=None,
                     model=payload.model,
-                    detail="outcome=bounded_single_anchorless_retry",
+                    detail=(
+                        f"reason={durable_full_resend_replay_rejection_reason or 'unknown'} "
+                        f"proxy_injected={proxy_injected_previous_response_id}"
+                    ),
                     cache_key_family=bridge_session_key.affinity_kind,
                     model_class=_extract_model_class(payload.model) if payload.model else None,
                 )

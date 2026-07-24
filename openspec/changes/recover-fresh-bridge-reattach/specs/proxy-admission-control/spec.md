@@ -11,6 +11,11 @@ the single recovery is exhausted, the proxy MUST emit the existing structured
 `upstream_request_timeout` failure, settle ownership once, and retire the whole
 bridge without an account-health penalty.
 
+When replay-safety checks reject recovery for a fresh durable reattach, the
+service MUST emit a structured bridge event with a bounded, payload-free reason
+code. The diagnostic MUST NOT include request text, input item types, tool
+names, item identifiers, or content.
+
 The streaming response lifecycle MUST own the pending first-item probe and its
 source iterator. If downstream teardown occurs before the response body begins
 iteration, it MUST cancel and await the probe, close the source, and allow the
@@ -31,3 +36,10 @@ leases. Cleanup MUST be idempotent and MUST NOT depend on garbage collection.
 - **WHEN** response cleanup runs
 - **THEN** the first-item task and source iterator are closed promptly
 - **AND** the request does not remain pending until the eventless watchdog
+
+#### Scenario: Rejected fresh replay is classified without payload data
+
+- **GIVEN** a fresh durable reattach fails a replay-safety predicate
+- **WHEN** the proxy keeps the request on its owner-bound anchored path
+- **THEN** it logs the bounded rejection reason
+- **AND** the diagnostic contains no request or input payload fields
