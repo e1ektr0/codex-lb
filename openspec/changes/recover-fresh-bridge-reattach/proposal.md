@@ -13,8 +13,8 @@ eventually retires the request.
 
 ## What Changes
 
-- Project proxy-injected fresh-bridge continuations into the existing verified
-  account-neutral full-resend shape before their first upstream send.
+- Preserve client-unanchored full resends on their durable owner instead of
+  injecting a response anchor before the first send on a fresh bridge.
 - Give a verified client-supplied fresh-bridge full resend one bounded recovery
   without `previous_response_id` when the anchored attempt remains eventless.
 - Keep unsafe, owner-bound, or incomplete continuation payloads fail-closed and
@@ -32,8 +32,8 @@ None.
 
 ### Modified Capabilities
 
-- `responses-api-compat`: fresh durable reattach avoids repeating a poisoned
-  WebSocket anchor while preserving replay safety.
+- `responses-api-compat`: fresh durable reattach avoids creating or repeating a
+  poisoned WebSocket anchor while preserving replay safety.
 - `proxy-admission-control`: verified fresh reattach receives a shorter bounded
   startup deadline and response teardown releases bridge ownership promptly.
 

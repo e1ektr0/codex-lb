@@ -7129,7 +7129,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
 
 
 @pytest.mark.asyncio
-async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_resend(
+async def test_stream_via_http_bridge_preserves_trimmable_full_resend_on_fresh_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -7265,7 +7265,8 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
         account_neutral_classifier,
     )
     monkeypatch.setattr(service, "_prepare_http_bridge_request", fake_prepare)
-    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", AsyncMock(return_value=session))
+    get_or_create = AsyncMock(return_value=session)
+    monkeypatch.setattr(service, "_get_or_create_http_bridge_session", get_or_create)
     monkeypatch.setattr(service, "_submit_http_bridge_request", AsyncMock())
     monkeypatch.setattr(service, "_detach_http_bridge_request", AsyncMock())
 
@@ -7288,13 +7289,11 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
     ]
 
     assert chunks == []
-    assert prepared_previous_response_ids == [None, "resp_latest", "resp_latest"]
-    assert prepared_input_lengths == [3, 3, 1]
+    assert prepared_previous_response_ids == [None]
+    assert prepared_input_lengths == [3]
     assert all("tools" not in frame for frame in prepared_frames)
-    assert prepared_frames[-1]["input"] == [input_items[-1]]
+    assert prepared_frames[-1]["input"] == input_items
     assert [frame["client_metadata"][CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY] for frame in prepared_frames] == [
-        "true",
-        "true",
         "true",
     ]
     assert all(
@@ -7308,6 +7307,11 @@ async def test_stream_via_http_bridge_injects_durable_anchor_for_trimmable_full_
         for frame in prepared_frames
     )
     assert cast(dict[str, Any], payload.to_payload()["reasoning"])["context"] == "last_turn"
+    creation = get_or_create.await_args
+    assert creation is not None
+    assert creation.kwargs["previous_response_id"] is None
+    assert creation.kwargs["preferred_account_id"] == "acc-1"
+    assert session.last_completed_response_id is None
     account_neutral_classifier.assert_not_called()
 
 
@@ -8488,7 +8492,7 @@ async def test_stream_via_http_bridge_proves_fallback_owner_key_before_legacy_fo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("forward_to_active_owner", [False, True], ids=["local_create", "owner_forward"])
-async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavailable_fresh_resend(
+async def test_stream_via_http_bridge_preserves_local_full_resend_and_recovers_failed_owner_forward(
     monkeypatch: pytest.MonkeyPatch,
     forward_to_active_owner: bool,
 ) -> None:
@@ -8662,17 +8666,24 @@ async def test_stream_via_http_bridge_clears_injected_anchor_after_owner_unavail
     has_live_call = has_live_local_session.await_args
     assert has_live_call is not None
     assert has_live_call.kwargs["include_retiring_with_visible_requests"] is False
-    assert has_live_call.kwargs["previous_response_id"] == (None if forward_to_active_owner else "resp_latest")
+    assert has_live_call.kwargs["previous_response_id"] is None
     if forward_to_active_owner:
         assert prepared_previous_response_ids == [None, None, None]
         assert forwarded_payloads == [payload]
         assert get_or_create_kwargs[-1]["exclude_account_ids"] == {"acc-1"}
+        assert get_or_create_kwargs[-1]["allow_forward_to_owner"] is False
+        assert get_or_create_kwargs[-1]["headers"] == {}
     else:
-        assert prepared_previous_response_ids[-2:] == ["resp_latest", None]
+        assert prepared_previous_response_ids == [None]
         assert forwarded_payloads == []
         assert get_or_create_kwargs[-1]["exclude_account_ids"] is None
-    assert get_or_create_kwargs[-1]["allow_forward_to_owner"] is False
-    assert get_or_create_kwargs[-1]["headers"] == {}
+        assert get_or_create_kwargs[-1]["allow_forward_to_owner"] is True
+        assert get_or_create_kwargs[-1]["headers"] == {
+            "x-codex-session-id": "session-shared-with-retired-owner",
+            "x-codex-turn-state": "http_turn_fresh",
+        }
+        assert get_or_create_kwargs[-1]["preferred_account_id"] == "acc-1"
+        assert get_or_create_kwargs[-1]["durable_lookup"] is not None
     assert request_states[-1].previous_response_id is None
     assert request_states[-1].proxy_injected_previous_response_id is False
 
@@ -17521,6 +17532,8 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
     }
     if unsafe_replay_input == "conversation":
         payload_data["conversation"] = "conv_owner_scoped"
+    if unsafe_replay_input == "missing_prior_output":
+        payload_data["previous_response_id"] = "resp_completed_anchor"
     payload = proxy_service.ResponsesRequest.model_validate(payload_data)
     durable_lookup = proxy_service.DurableBridgeLookup(
         session_id="durable-owner-unavailable",
@@ -17569,7 +17582,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         idle_ttl_seconds=120.0,
     )
     replacement_session = _make_bridge_session(key=session.key, key_value=session.key.affinity_key)
-    preprojected_fresh_reattach = stored_model is None and unsafe_replay_input in {None, "missing_owner"}
+    preprojected_fresh_reattach = stored_model is None and unsafe_replay_input == "missing_owner"
     get_or_create = AsyncMock(
         side_effect=(
             [session, replacement_session]
@@ -17667,16 +17680,16 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
 
         assert exc_info.value is owner_unavailable
         assert get_or_create.await_count == 1
-        if unsafe_replay_input == "conversation":
+        if unsafe_replay_input == "missing_prior_output":
+            assert "http_bridge_event event=fresh_reattach_replay_rejected" in caplog.text
+            assert "reason=prior_output_not_retained" in caplog.text
+            assert "proxy_injected=False" in caplog.text
+        else:
             assert "http_bridge_event event=fresh_reattach_replay_rejected" not in caplog.text
+        if unsafe_replay_input == "conversation":
             last_call = get_or_create.await_args
             assert last_call is not None
             assert last_call.kwargs["previous_response_id"] is None
-        else:
-            assert "http_bridge_event event=fresh_reattach_replay_rejected" in caplog.text
-            assert "proxy_injected=True" in caplog.text
-        if unsafe_replay_input == "file":
-            assert "reason=account_bound_payload" in caplog.text
         if unsafe_replay_input in {"missing_prior_output", "orphan_output"}:
             account_neutral_classifier.assert_not_called()
         else:
@@ -17714,7 +17727,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
         first_call = get_or_create.await_args_list[0]
         second_call = get_or_create.await_args_list[1]
         third_call = get_or_create.await_args_list[2]
-        assert first_call.kwargs["previous_response_id"] == ("resp_completed_anchor" if stored_model is None else None)
+        assert first_call.kwargs["previous_response_id"] is None
         assert first_call.kwargs["preferred_account_id"] == "acc-owner"
         assert first_call.kwargs["allow_forward_to_owner"] is True
         assert second_call.kwargs["previous_response_id"] is None

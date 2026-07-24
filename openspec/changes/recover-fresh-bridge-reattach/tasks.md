@@ -15,3 +15,4 @@
 - [x] 3.2 Cover unsafe replay rejection, bounded eventless failure, and downstream teardown.
 - [x] 3.3 Run focused tests, bridge integration, lint, type checking, architecture, and OpenSpec validation.
 - [x] 3.4 Classify fresh-reattach replay rejection with payload-free diagnostics.
+- [x] 3.5 Preserve client-unanchored tool-loop full resends on a fresh durable bridge.

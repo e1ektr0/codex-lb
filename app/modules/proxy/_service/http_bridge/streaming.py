@@ -987,7 +987,7 @@ class _HTTPBridgeStreamingMixin:
                 include_retiring_with_visible_requests=False,
             )
             forwards_to_active_owner = await self._http_bridge_can_forward_to_active_owner(durable_lookup)
-            if (
+            fresh_reattach_can_use_durable_anchor = (
                 not live_local_session_exists
                 and not forwards_to_active_owner
                 and payload.previous_response_id is None
@@ -995,7 +995,18 @@ class _HTTPBridgeStreamingMixin:
                 and bridge_session_key.strength == "hard"
                 and durable_lookup.latest_response_id is not None
                 and (not payload_looks_like_full_resend or durable_anchor_trimmable)
-            ):
+            )
+            if fresh_reattach_can_use_durable_anchor and payload_looks_like_full_resend:
+                _log_http_bridge_event(
+                    "fresh_reattach_full_resend_preserved",
+                    bridge_session_key,
+                    account_id=durable_lookup.account_id,
+                    model=payload.model,
+                    detail="outcome=client_unanchored_full_resend",
+                    cache_key_family=bridge_session_key.affinity_kind,
+                    model_class=_extract_model_class(payload.model) if payload.model else None,
+                )
+            elif fresh_reattach_can_use_durable_anchor:
                 effective_payload = payload.model_copy(
                     update={"previous_response_id": durable_lookup.latest_response_id}
                 )
@@ -1011,19 +1022,6 @@ class _HTTPBridgeStreamingMixin:
                     cache_key_family=bridge_session_key.affinity_kind,
                     model_class=_extract_model_class(payload.model) if payload.model else None,
                 )
-                if payload_looks_like_full_resend:
-                    _log_http_bridge_event(
-                        "durable_full_resend_anchor_injected",
-                        bridge_session_key,
-                        account_id=None,
-                        model=payload.model,
-                        detail=(
-                            f"response_id={durable_lookup.latest_response_id} "
-                            f"stored_items={durable_full_resend_anchor_count}"
-                        ),
-                        cache_key_family=bridge_session_key.affinity_kind,
-                        model_class=_extract_model_class(payload.model) if payload.model else None,
-                    )
                 live_local_session_exists = await self._http_bridge_has_live_local_session(
                     key=bridge_session_key,
                     incoming_turn_state=incoming_turn_state_header,
@@ -1303,6 +1301,21 @@ class _HTTPBridgeStreamingMixin:
             durable_full_resend_is_account_neutral = None
             durable_lookup = None
             file_required_preferred_account = False
+
+        fresh_unanchored_full_resend_owner_missing = (
+            durable_lookup is not None
+            and not live_local_session_exists
+            and not forwards_to_active_owner
+            and request_state.previous_response_id is None
+            and payload_looks_like_full_resend
+            and durable_lookup.account_id is None
+        )
+        if fresh_unanchored_full_resend_owner_missing and durable_full_resend_allows_account_neutral_replay():
+            switch_to_account_neutral_replay(
+                event_name="fresh_reattach_owner_missing_full_resend",
+                detail="outcome=projected_ownerless_full_resend",
+                exclude_current_owner=False,
+            )
 
         fresh_bridge_durable_reattach = (
             durable_lookup is not None
@@ -1734,7 +1747,8 @@ class _HTTPBridgeStreamingMixin:
                 return
         session = session_or_forward
         if (
-            durable_full_resend_anchor_count is not None
+            proxy_injected_previous_response_id
+            and durable_full_resend_anchor_count is not None
             and durable_full_resend_anchor_fingerprint is not None
             and durable_lookup is not None
             and durable_lookup.latest_response_id is not None

@@ -2,16 +2,14 @@
 
 ### Requirement: Fresh HTTP bridge continuation reattach avoids poisoned anchors
 
-The service MUST avoid sending a safely removable proxy-injected durable anchor as the first request on a fresh upstream WebSocket.
+The service MUST avoid sending a proxy-injected durable anchor as the first request on a fresh upstream WebSocket when the client supplied a full resend with a verified stored prefix.
 
 When an HTTP Responses request resolves durable continuity but no reusable
-local bridge or active remote bridge owner exists, the service MUST NOT repeat
-the same proxy-injected `previous_response_id` as the first request on newly
-created upstream WebSockets when the client supplied a verified self-contained
-full resend. It MUST use the existing raw-prefix proof, account-neutral input
-projection, retained-output proof, opaque-state rejection, affinity stripping,
-and server-namespaced recovery lane to submit the projected request once
-without `previous_response_id`.
+local bridge or active remote bridge owner exists, the service MUST preserve a
+client-unanchored full resend without adding `previous_response_id`. It MUST
+keep the durable owner and hard affinity while submitting the original request
+once. This rule applies before upstream dispatch and therefore does not replay
+an accepted request or require cross-account replay eligibility.
 
 A client-supplied `previous_response_id` with the same verified replay body MAY
 be attempted on the required owner. If that fresh-bridge attempt remains
@@ -34,13 +32,21 @@ Known response-owned reasoning and hosted-search bookkeeping MAY be removed by
 that projection. A transport error after an ambiguous send MUST NOT by itself
 authorize replay.
 
-#### Scenario: Proxy-injected fresh anchor is projected before dispatch
+#### Scenario: Client full resend remains unanchored before fresh dispatch
 
 - **GIVEN** a request omits `previous_response_id` but carries a verified full resend for a durable bridge
 - **AND** neither a live local bridge nor an active remote owner can receive the request
-- **WHEN** the proxy would otherwise inject the durable response id into a fresh upstream WebSocket
-- **THEN** it sends one validated projected request without `previous_response_id`
-- **AND** it does not first send the poisoned anchored shape
+- **WHEN** the proxy creates a fresh upstream WebSocket on the durable owner
+- **THEN** it sends the client's full resend once without `previous_response_id`
+- **AND** it does not create the poisoned anchored shape
+
+#### Scenario: Tool-loop full resend needs no assistant-message replay proof
+
+- **GIVEN** a client-unanchored full resend continues a tool loop without a completed assistant-message boundary
+- **AND** its stored input prefix matches the durable session
+- **WHEN** the request starts on a fresh upstream WebSocket
+- **THEN** the proxy preserves the unanchored request on the durable owner
+- **AND** retained-output replay checks do not block the original first send
 
 #### Scenario: Client anchor receives one bounded fresh replay
 

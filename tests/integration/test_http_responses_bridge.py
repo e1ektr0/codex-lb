@@ -7099,9 +7099,7 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
 
 
 @pytest.mark.asyncio
-async def test_v1_responses_http_bridge_projects_proxy_injected_anchor_before_fresh_bridge_send(
-    async_client, monkeypatch
-):
+async def test_v1_responses_http_bridge_preserves_full_resend_before_fresh_bridge_send(async_client, monkeypatch):
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
         async_client,
@@ -7190,7 +7188,7 @@ async def test_v1_responses_http_bridge_projects_proxy_injected_anchor_before_fr
     assert second.json()["id"] == "resp_project_replay_1"
     assert len(connect_headers) == 2
     replay_connect_headers = {key.lower(): value for key, value in connect_headers[1].items()}
-    assert "x-codex-session-id" not in replay_connect_headers
+    assert replay_connect_headers["x-codex-session-id"] == session_headers["x-codex-session-id"]
     assert len(first_upstream.sent_text) == 1
     assert len(replay_upstream.sent_text) == 1
     replay_payload = json.loads(replay_upstream.sent_text[0])
