@@ -389,19 +389,28 @@ def _bridge_service(
     monkeypatch: pytest.MonkeyPatch,
     *,
     dashboard_transport: str,
+    dashboard_policy: str = "always_websocket",
 ) -> Any:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     monkeypatch.setattr(
         http_bridge_streaming_module,
         "_service_get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(upstream_stream_transport=dashboard_transport))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    upstream_stream_transport=dashboard_transport,
+                    http_downstream_transport_policy=dashboard_policy,
+                )
+            )
         ),
     )
     monkeypatch.setattr(
         http_bridge_streaming_module,
         "_service_get_settings",
-        lambda: SimpleNamespace(upstream_stream_transport="auto"),
+        lambda: SimpleNamespace(
+            upstream_stream_transport="auto",
+            http_downstream_transport_policy="smart",
+        ),
     )
     monkeypatch.setattr(
         http_bridge_streaming_module,
@@ -428,7 +437,12 @@ def _pre_submit_error() -> ProxyResponseError:
     return exc
 
 
-async def _collect_bridge_stream(service: Any, *, api_key_reservation: Any = None) -> list[str]:
+async def _collect_bridge_stream(
+    service: Any,
+    *,
+    api_key: Any = None,
+    api_key_reservation: Any = None,
+) -> list[str]:
     return [
         chunk
         async for chunk in service._stream_http_bridge_or_retry(
@@ -437,7 +451,7 @@ async def _collect_bridge_stream(service: Any, *, api_key_reservation: Any = Non
             codex_session_affinity=True,
             propagate_http_errors=True,
             openai_cache_affinity=False,
-            api_key=None,
+            api_key=api_key,
             api_key_reservation=api_key_reservation,
             suppress_text_done_events=False,
         )
@@ -467,6 +481,89 @@ async def test_http_bridge_bypassed_when_upstream_transport_pinned_http(
     assert chunks == ['data: {"type":"response.completed"}\n\n']
     assert len(retry_calls) == 1
     assert retry_calls[0]["upstream_stream_transport_override"] == "http"
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_bypassed_when_effective_policy_is_always_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _bridge_service(
+        monkeypatch,
+        dashboard_transport="default",
+        dashboard_policy="always_http",
+    )
+    retry_calls: list[dict[str, Any]] = []
+
+    async def record_stream_with_retry(*_args: object, **kwargs: object):
+        retry_calls.append(cast(dict[str, Any], kwargs))
+        yield 'data: {"type":"response.completed"}\n\n'
+
+    async def bridge_must_not_run(*_args: object, **_kwargs: object):
+        raise AssertionError("bridge must be bypassed when effective policy is always_http")
+        yield ""
+
+    monkeypatch.setattr(service, "_stream_with_retry", record_stream_with_retry)
+    monkeypatch.setattr(service, "_stream_via_http_bridge", bridge_must_not_run)
+
+    chunks = await _collect_bridge_stream(service)
+
+    assert chunks == ['data: {"type":"response.completed"}\n\n']
+    assert retry_calls[0]["upstream_stream_transport_override"] == "http"
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_transport_policy_honors_api_key_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _bridge_service(
+        monkeypatch,
+        dashboard_transport="default",
+        dashboard_policy="always_websocket",
+    )
+    retry_calls: list[dict[str, Any]] = []
+    api_key = SimpleNamespace(transport_policy_override="always_http")
+
+    async def record_stream_with_retry(*_args: object, **kwargs: object):
+        retry_calls.append(cast(dict[str, Any], kwargs))
+        yield 'data: {"type":"response.completed"}\n\n'
+
+    async def bridge_must_not_run(*_args: object, **_kwargs: object):
+        raise AssertionError("per-key always_http must bypass bridge")
+        yield ""
+
+    monkeypatch.setattr(service, "_stream_with_retry", record_stream_with_retry)
+    monkeypatch.setattr(service, "_stream_via_http_bridge", bridge_must_not_run)
+
+    await _collect_bridge_stream(service, api_key=api_key)
+
+    assert retry_calls[0]["upstream_stream_transport_override"] == "http"
+
+
+@pytest.mark.asyncio
+async def test_explicit_websocket_transport_keeps_bridge_despite_http_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _bridge_service(
+        monkeypatch,
+        dashboard_transport="websocket",
+        dashboard_policy="always_http",
+    )
+    bridge_calls: list[bool] = []
+
+    async def bridge_stream(*_args: object, **_kwargs: object):
+        bridge_calls.append(True)
+        yield 'data: {"type":"response.completed"}\n\n'
+
+    async def retry_must_not_run(*_args: object, **_kwargs: object):
+        raise AssertionError("explicit websocket transport must keep bridge eligibility")
+        yield ""
+
+    monkeypatch.setattr(service, "_stream_via_http_bridge", bridge_stream)
+    monkeypatch.setattr(service, "_stream_with_retry", retry_must_not_run)
+
+    await _collect_bridge_stream(service)
+
+    assert bridge_calls == [True]
 
 
 @pytest.mark.asyncio

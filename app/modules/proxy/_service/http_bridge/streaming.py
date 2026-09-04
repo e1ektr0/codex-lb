@@ -174,6 +174,11 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
+from app.modules.proxy._service.streaming.retry import (
+    _effective_http_downstream_transport_policy,
+    _resolve_http_downstream_transport,
+    _resolved_configured_stream_transport,
+)
 from app.modules.proxy._service.support import (
     _ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS,
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
@@ -1006,9 +1011,10 @@ class _HTTPBridgeStreamingMixin:
         # The bridge exists to hold upstream websocket sessions, so a pinned
         # "http" upstream transport must bypass it; without this gate the
         # dashboard pin is silently ignored for bridged follow-up turns.
-        configured_upstream_transport = getattr(dashboard_settings, "upstream_stream_transport", "default")
-        if configured_upstream_transport == "default":
-            configured_upstream_transport = getattr(_service_get_settings(), "upstream_stream_transport", "auto")
+        configured_upstream_transport, _ = _resolved_configured_stream_transport(
+            dashboard_settings,
+            _service_get_settings(),
+        )
         if runtime_config.enabled and configured_upstream_transport == "http":
             logger.info(
                 "stream_responses bypassing http bridge for pinned http upstream transport request_id=%s",
@@ -1016,6 +1022,22 @@ class _HTTPBridgeStreamingMixin:
             )
             force_upstream_stream_transport = "http"
             runtime_config = dataclasses.replace(runtime_config, enabled=False)
+        elif runtime_config.enabled and configured_upstream_transport not in {"http", "websocket"}:
+            policy, override_applied = _effective_http_downstream_transport_policy(
+                api_key,
+                dashboard_settings,
+                _service_get_settings(),
+            )
+            if _resolve_http_downstream_transport(policy, payload=payload, headers=headers) == "http":
+                logger.info(
+                    "stream_responses bypassing http bridge for downstream HTTP transport policy=%s "
+                    "override_applied=%s request_id=%s",
+                    policy,
+                    override_applied,
+                    request_id,
+                )
+                force_upstream_stream_transport = "http"
+                runtime_config = dataclasses.replace(runtime_config, enabled=False)
         # While the websocket transport-failure marker is armed, every
         # responses path must degrade to the HTTP upstream: the bridge would
         # stall on its websocket session creation, and the raw path's "smart"

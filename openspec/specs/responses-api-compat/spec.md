@@ -3399,6 +3399,7 @@ through to the global `http_downstream_transport_policy`.
 - **WHEN** a downstream HTTP request resolves the upstream transport,
   regardless of sticky signals
 - **THEN** the request MUST be sent over upstream HTTP `POST`
+- **AND** HTTP bridge admission MUST be bypassed before any upstream WebSocket is opened
 
 #### Scenario: always_websocket policy never downgrades sticky-less HTTP
 

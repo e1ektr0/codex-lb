@@ -224,6 +224,7 @@ def _make_dashboard_settings(
     prefer_earlier_reset_accounts: bool = False,
     gateway_safe_mode: bool = False,
     prompt_cache_idle_ttl_seconds: int | float = 3600,
+    http_downstream_transport_policy: str = "always_websocket",
 ) -> DashboardSettings:
     return DashboardSettings(
         id=1,
@@ -237,6 +238,7 @@ def _make_dashboard_settings(
         api_key_auth_enabled=False,
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=int(prompt_cache_idle_ttl_seconds),
         http_responses_session_bridge_gateway_safe_mode=gateway_safe_mode,
+        http_downstream_transport_policy=http_downstream_transport_policy,
         sticky_reallocation_budget_threshold_pct=95.0,
     )
 
@@ -269,6 +271,7 @@ def _install_bridge_settings_with_limits(
     prefer_earlier_reset_accounts: bool = False,
     instance_id: str = "instance-a",
     instance_ring: list[str] | None = None,
+    http_downstream_transport_policy: str = "always_websocket",
 ) -> None:
     _install_proxy_settings(
         monkeypatch,
@@ -286,6 +289,7 @@ def _install_bridge_settings_with_limits(
             prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
             gateway_safe_mode=gateway_safe_mode,
             prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
+            http_downstream_transport_policy=http_downstream_transport_policy,
         ),
     )
 
@@ -7123,6 +7127,48 @@ async def test_v1_responses_http_bridge_kill_switch_falls_back_to_legacy_path(as
     assert response.status_code == 200
     assert response.json()["id"] == "resp_legacy"
     assert "x-codex-turn-state" not in response.headers
+    assert seen["legacy"] == 1
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_always_http_policy_bypasses_enabled_bridge(async_client, monkeypatch):
+    _install_bridge_settings_with_limits(
+        monkeypatch,
+        enabled=True,
+        http_downstream_transport_policy="always_http",
+    )
+    await _import_account(async_client, "acc_http_policy_bypass", "http-policy-bypass@example.com")
+    seen = {"legacy": 0}
+
+    async def fake_legacy_stream(
+        payload,
+        headers,
+        access_token,
+        account_id,
+        base_url=None,
+        raise_for_status=False,
+        **kwargs,
+    ):
+        del payload, headers, access_token, account_id, base_url, raise_for_status
+        assert kwargs["upstream_stream_transport_override"] == "http"
+        seen["legacy"] += 1
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_http_policy",'
+            '"object":"response","status":"completed",'
+            '"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2,'
+            '"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}}}}\n\n'
+        )
+
+    async def fail_connect(*args, **kwargs):
+        raise AssertionError("always_http policy must bypass bridge websocket creation")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_legacy_stream)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fail_connect)
+
+    response = await async_client.post("/v1/responses", json={"model": "gpt-5.1", "input": "hi"})
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_http_policy"
     assert seen["legacy"] == 1
 
 

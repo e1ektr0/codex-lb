@@ -1358,7 +1358,11 @@ async def test_hard_continuity_operation_replay_requires_matching_unknown_fence(
 
 
 def _make_app_settings(*, bridge_enabled: bool = True, **overrides: Any) -> Settings:
-    return Settings(http_responses_session_bridge_enabled=bridge_enabled, **overrides)
+    return Settings(
+        http_responses_session_bridge_enabled=bridge_enabled,
+        http_downstream_transport_policy="always_websocket",
+        **overrides,
+    )
 
 
 def _make_bridge_session(
