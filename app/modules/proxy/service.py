@@ -520,6 +520,9 @@ from app.modules.proxy._service.streaming.helpers import (
     _is_account_neutral_transport_drop as _is_account_neutral_transport_drop,
 )
 from app.modules.proxy._service.streaming.helpers import (
+    _is_account_neutral_websocket_transport_end as _is_account_neutral_websocket_transport_end,
+)
+from app.modules.proxy._service.streaming.helpers import (
     _push_stream_attempt_timeout_overrides as _push_stream_attempt_timeout_overrides,
 )
 from app.modules.proxy._service.streaming.helpers import (

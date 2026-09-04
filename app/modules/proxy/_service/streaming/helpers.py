@@ -500,6 +500,12 @@ def _is_account_neutral_transport_drop(
     return close_code in (None, 1006)
 
 
+def _is_account_neutral_websocket_transport_end(message: object) -> bool:
+    kind = getattr(message, "kind", None)
+    transport_ended = kind == "close" or (kind == "error" and bool(getattr(message, "transport_ended", False)))
+    return transport_ended and _is_account_neutral_transport_drop(getattr(message, "close_code", None))
+
+
 def _should_infer_upstream_status_from_proxy_error(exc: ProxyResponseError, upstream_error_code: str | None) -> bool:
     if exc.failure_phase == "status":
         return True

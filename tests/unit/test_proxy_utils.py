@@ -44,6 +44,7 @@ from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
     CodexUpstreamWebSocket,
     UpstreamWebSocket,
+    UpstreamWebSocketMessage,
     UpstreamWebSocketTransportError,
     WebsocketsUpstreamWebSocket,
 )
@@ -4157,6 +4158,7 @@ async def test_stream_http_bridge_or_retry_bypasses_bridge_for_input_image(monke
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     settings = _make_proxy_settings()
     settings.http_responses_stream_request_budget_seconds = 180.0
+    settings.http_downstream_transport_policy = "always_websocket"
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     monkeypatch.setattr(
@@ -29977,7 +29979,7 @@ async def test_process_upstream_websocket_text_does_not_fresh_retry_injected_too
 
 
 @pytest.mark.asyncio
-async def test_process_upstream_websocket_text_maps_previous_response_usage_limit_to_upstream_unavailable(
+async def test_process_upstream_websocket_text_preserves_previous_response_usage_limit_when_replay_is_unsafe(
     monkeypatch,
 ):
     request_logs = _RequestLogsRecorder()
@@ -30032,22 +30034,19 @@ async def test_process_upstream_websocket_text_maps_previous_response_usage_limi
         response_create_gate=asyncio.Semaphore(1),
     )
 
-    assert '"code":"upstream_unavailable"' in downstream_text
-    handle_stream_error.assert_awaited_once()
-    handle_call = handle_stream_error.await_args
-    assert handle_call is not None
-    assert handle_call.args[0] == account
-    assert handle_call.args[2] == "usage_limit_reached"
+    assert downstream_text == upstream_text
+    handle_stream_error.assert_not_awaited()
     finalize_request_state.assert_awaited_once()
     finalize_call = finalize_request_state.await_args
     assert finalize_call is not None
-    assert finalize_call.kwargs["event_type"] == "response.failed"
+    assert finalize_call.kwargs["event_type"] == "error"
     payload = finalize_call.kwargs["payload"]
     assert isinstance(payload, dict)
-    response_payload = cast(dict[str, JsonValue], payload["response"])
-    error_payload = cast(dict[str, JsonValue], response_payload["error"])
-    assert error_payload["code"] == "upstream_unavailable"
-    assert error_payload["message"] == "Previous response owner account is unavailable; retry later."
+    error_payload = cast(dict[str, JsonValue], payload["error"])
+    assert payload["status"] == 429
+    assert error_payload["type"] == "invalid_request_error"
+    assert error_payload["code"] == "usage_limit_reached"
+    assert error_payload["message"] == "The usage limit has been reached"
     assert upstream_control.reconnect_requested is False
     assert upstream_control.suppress_downstream_event is False
     assert upstream_control.replay_request_state is None
@@ -30801,10 +30800,17 @@ async def test_process_upstream_websocket_text_keeps_file_backed_verified_anchor
         response_create_gate=asyncio.Semaphore(1),
     )
 
-    assert '"code":"upstream_unavailable"' in downstream_text
-    assert "usage_limit_reached" not in downstream_text
-    handle_stream_error.assert_awaited_once()
+    assert downstream_text == json.dumps(upstream_payload, separators=(",", ":"))
+    handle_stream_error.assert_not_awaited()
     finalize_request_state.assert_awaited_once()
+    finalize_call = finalize_request_state.await_args
+    assert finalize_call is not None
+    assert finalize_call.kwargs["event_type"] == "error"
+    finalized_payload = finalize_call.kwargs["payload"]
+    assert isinstance(finalized_payload, dict)
+    assert finalized_payload["status"] == 429
+    finalized_error = cast(dict[str, JsonValue], finalized_payload["error"])
+    assert finalized_error["code"] == "usage_limit_reached"
     assert upstream_control.reconnect_requested is False
     assert upstream_control.suppress_downstream_event is False
     assert upstream_control.replay_request_state is None
@@ -33361,10 +33367,21 @@ async def test_relay_upstream_websocket_liveness_timeout_preserves_sequenced_fai
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("routed", [False, True], ids=["direct-close", "routed-receive-error"])
-async def test_relay_upstream_websocket_ordinary_receive_failure_is_stream_incomplete_and_penalized(
+@pytest.mark.parametrize(
+    ("transport_case", "expected_penalty"),
+    [
+        ("direct-authored-close", True),
+        ("direct-frameless", False),
+        ("routed-frameless", False),
+        ("close-kind-none", False),
+        ("close-kind-1006", False),
+        ("protocol-error", True),
+    ],
+)
+async def test_relay_upstream_websocket_ordinary_receive_failure_preserves_health_attribution(
     monkeypatch,
-    routed: bool,
+    transport_case: str,
+    expected_penalty: bool,
 ):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -33389,9 +33406,36 @@ async def test_relay_upstream_websocket_ordinary_receive_failure_is_stream_incom
         async def close(self) -> None:
             return None
 
+    class _FramelessCloseConnection:
+        async def recv(self) -> str:
+            raise ConnectionClosedError(None, None)
+
+        async def close(self) -> None:
+            return None
+
     class _RoutedReceiveFailureWebSocket:
         async def receive(self) -> aiohttp.WSMessage:
             raise ConnectionResetError("upstream reset")
+
+        async def close(self) -> None:
+            return None
+
+    class _ProtocolErrorUpstream:
+        async def receive(self) -> UpstreamWebSocketMessage:
+            return UpstreamWebSocketMessage(
+                kind="error",
+                error="Unexpected websocket message type",
+            )
+
+        async def close(self) -> None:
+            return None
+
+    class _FrameLessCloseMessageUpstream:
+        def __init__(self, close_code: int | None) -> None:
+            self._close_code = close_code
+
+        async def receive(self) -> UpstreamWebSocketMessage:
+            return UpstreamWebSocketMessage(kind="close", close_code=self._close_code)
 
         async def close(self) -> None:
             return None
@@ -33412,11 +33456,18 @@ async def test_relay_upstream_websocket_ordinary_receive_failure_is_stream_incom
     upstream_control = proxy_service._WebSocketUpstreamControl()
     downstream = _FakeDownstreamWebSocket()
     account = _make_account("acc_ws_ordinary_close")
-    upstream = (
-        CodexUpstreamWebSocket(_RoutedReceiveFailureWebSocket())
-        if routed
-        else WebsocketsUpstreamWebSocket(cast(Any, _OrdinaryCloseConnection()))
-    )
+    if transport_case == "routed-frameless":
+        upstream = CodexUpstreamWebSocket(_RoutedReceiveFailureWebSocket())
+    elif transport_case == "direct-frameless":
+        upstream = WebsocketsUpstreamWebSocket(cast(Any, _FramelessCloseConnection()))
+    elif transport_case == "protocol-error":
+        upstream = cast(proxy_service.UpstreamWebSocket, _ProtocolErrorUpstream())
+    elif transport_case == "close-kind-none":
+        upstream = cast(proxy_service.UpstreamWebSocket, _FrameLessCloseMessageUpstream(None))
+    elif transport_case == "close-kind-1006":
+        upstream = cast(proxy_service.UpstreamWebSocket, _FrameLessCloseMessageUpstream(1006))
+    else:
+        upstream = WebsocketsUpstreamWebSocket(cast(Any, _OrdinaryCloseConnection()))
 
     await service._relay_upstream_websocket_messages(
         cast(WebSocket, downstream),
@@ -33438,11 +33489,14 @@ async def test_relay_upstream_websocket_ordinary_receive_failure_is_stream_incom
     assert list(pending_requests) == []
     terminal = json.loads(downstream.sent_text[-1])
     assert terminal["response"]["error"]["code"] == "stream_incomplete"
-    handle_stream_error.assert_awaited_once()
-    handle_stream_error_args = handle_stream_error.await_args
-    assert handle_stream_error_args is not None
-    assert handle_stream_error_args.args[0] is account
-    assert handle_stream_error_args.args[2] == "stream_incomplete"
+    if expected_penalty:
+        handle_stream_error.assert_awaited_once()
+        handle_stream_error_args = handle_stream_error.await_args
+        assert handle_stream_error_args is not None
+        assert handle_stream_error_args.args[0] is account
+        assert handle_stream_error_args.args[2] == "stream_incomplete"
+    else:
+        handle_stream_error.assert_not_awaited()
 
 
 @pytest.mark.asyncio

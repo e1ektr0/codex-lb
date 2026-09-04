@@ -380,6 +380,10 @@ def _is_account_neutral_transport_drop(*args: Any, **kwargs: Any) -> Any:
     return _service_global("_is_account_neutral_transport_drop")(*args, **kwargs)
 
 
+def _is_account_neutral_websocket_transport_end(*args: Any, **kwargs: Any) -> Any:
+    return _service_global("_is_account_neutral_websocket_transport_end")(*args, **kwargs)
+
+
 def _websocket_auth_failure_permanent_code(*args: Any, **kwargs: Any) -> Any:
     return _service_global("_websocket_auth_failure_permanent_code")(*args, **kwargs)
 

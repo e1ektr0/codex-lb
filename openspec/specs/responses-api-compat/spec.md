@@ -351,6 +351,18 @@ acknowledged rather than recoverable. Only a frame-less drop with zero response 
 buffered model output MAY contribute to the existing windowed eventless account
 drain signal; a post-output drop MUST NOT contribute to that signal.
 
+A terminal direct Responses WebSocket ending without an upstream-authored close
+frame MUST also remain account-neutral regardless of response progress when it
+is represented by a close-kind message or by an error-kind message with positive
+transport-ending provenance. This account-health rule MUST NOT authorize replay
+after visible or buffered output.
+
+When an already-selected continuity owner returns a retryable terminal event and
+account migration is not proven safe, the proxy MUST preserve the original
+sanitized upstream classification and MUST NOT rewrite it as owner unavailable.
+The existing owner-unavailable response remains reserved for pre-dispatch
+required-owner selection or connect failures.
+
 For other closes, the proxy MUST surface `stream_incomplete` to affected pending
 requests except when a direct Responses WebSocket request has already
 successfully emitted a finite integer `sequence_number`. For that sequenced
@@ -380,6 +392,7 @@ active response id, then MUST close the downstream WebSocket with code 1011.
 - **GIVEN** a direct Responses WebSocket request has successfully emitted a finite integer `sequence_number`
 - **WHEN** the upstream websocket closes before a terminal response event is observed
 - **AND** the close does not carry a classified process-wide network failure or upstream WebSocket liveness timeout
+- **AND** the close is not a frame-less direct transport ending
 - **THEN** the request is recorded as failed with `stream_incomplete`
 - **AND** no synthetic terminal frame is emitted under the active response id
 - **AND** the downstream WebSocket closes with code 1011

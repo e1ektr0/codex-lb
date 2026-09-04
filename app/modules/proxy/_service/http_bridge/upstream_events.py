@@ -94,7 +94,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _classify_upstream_close,
     _find_websocket_request_state_by_response_id,
     _http_error_status_from_payload,
-    _is_account_neutral_transport_drop,
+    _is_account_neutral_websocket_transport_end,
     _is_missing_tool_output_error,
     _is_previous_response_not_found_error,
     _is_security_work_authorization_required_error,
@@ -2140,10 +2140,8 @@ class _HTTPBridgeUpstreamEventsMixin:
                 # Only terminal transport messages qualify: a protocol-invalid
                 # binary frame also carries no close code but did not end the
                 # socket, so it keeps the existing penalty semantics.
-                account_neutral_transport_drop = (
-                    (message.kind == "close" or (message.kind == "error" and message.transport_ended))
-                    and not account_neutral
-                    and _is_account_neutral_transport_drop(message.close_code)
+                account_neutral_transport_drop = not account_neutral and _is_account_neutral_websocket_transport_end(
+                    message
                 )
                 async with session.lifecycle_lock:
                     if (

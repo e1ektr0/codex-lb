@@ -160,6 +160,7 @@ class _FakeUpstreamMessage:
         close_code: int | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        transport_ended: bool = False,
     ) -> None:
         self.kind = kind
         self.text = text
@@ -167,6 +168,7 @@ class _FakeUpstreamMessage:
         self.close_code = close_code
         self.error = error
         self.error_code = error_code
+        self.transport_ended = transport_ended
 
 
 class _FakeUpstreamWebSocket:
@@ -10255,9 +10257,11 @@ def test_backend_responses_websocket_retries_stale_account_model_route_on_anothe
     )
 
 
-def test_backend_responses_websocket_previous_response_usage_limit_returns_upstream_unavailable(
+@pytest.mark.parametrize("route", ["/v1/responses", "/backend-api/codex/responses"])
+def test_responses_websocket_previous_response_usage_limit_preserves_upstream_error(
     app_instance,
     monkeypatch,
+    route,
 ):
     first_upstream = _FakeUpstreamWebSocket(
         [
@@ -10363,13 +10367,15 @@ def test_backend_responses_websocket_previous_response_usage_limit_returns_upstr
     }
 
     with TestClient(app_instance) as client:
-        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+        with client.websocket_connect(route) as websocket:
             websocket.send_text(json.dumps(request_payload))
             event = json.loads(websocket.receive_text())
 
-    assert event["type"] == "response.failed"
-    assert event["response"]["error"]["code"] == "upstream_unavailable"
-    assert event["response"]["error"]["message"] == "Previous response owner account is unavailable; retry later."
+    assert event["type"] == "error"
+    assert event["status"] == 429
+    assert event["error"]["type"] == "invalid_request_error"
+    assert event["error"]["code"] == "usage_limit_reached"
+    assert event["error"]["message"] == "The usage limit has been reached"
     assert connect_models == ["gpt-5.1"]
     assert captured_preferred_accounts == ["acct_ws_proxy_owner"]
     assert handled_error_codes == ["usage_limit_reached"]
@@ -10820,6 +10826,97 @@ def test_backend_responses_websocket_emits_response_failed_before_close_on_upstr
     assert "close_code=1011" in failed_event["response"]["error"]["message"]
     assert len(log_calls) == 1
     assert log_calls[0]["request_id"] == "resp_ws_eof_retry"
+    assert log_calls[0]["status"] == "error"
+    assert log_calls[0]["error_code"] == "stream_incomplete"
+
+
+@pytest.mark.parametrize("route", ["/v1/responses", "/backend-api/codex/responses"])
+def test_responses_websocket_frameless_close_after_output_stays_account_neutral(
+    app_instance,
+    monkeypatch,
+    route,
+):
+    upstream = _FakeUpstreamWebSocket(
+        [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_ws_frameless", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.output_text.delta",
+                        "response_id": "resp_ws_frameless",
+                        "item_id": "msg_frameless",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": "partial output",
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage("error", error="no close frame received or sent", transport_ended=True),
+        ]
+    )
+    health_codes: list[str] = []
+    log_calls: list[dict[str, object]] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, *args, **kwargs):
+        del self, args, kwargs
+        return SimpleNamespace(id="acct_ws_frameless"), upstream
+
+    async def fake_handle_stream_error(self, account, error, code, **kwargs):
+        del self, account, error, kwargs
+        health_codes.append(code)
+
+    async def fake_write_request_log(self, **kwargs):
+        del self
+        log_calls.append(kwargs)
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", fake_handle_stream_error)
+    monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", fake_write_request_log)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(route) as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            events = [json.loads(websocket.receive_text()) for _ in range(3)]
+
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_text.delta",
+        "response.failed",
+    ]
+    assert events[-1]["response"]["error"]["code"] == "stream_incomplete"
+    assert len(upstream.sent_text) == 1
+    assert health_codes == []
+    assert len(log_calls) == 1
     assert log_calls[0]["status"] == "error"
     assert log_calls[0]["error_code"] == "stream_incomplete"
 

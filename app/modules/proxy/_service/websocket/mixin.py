@@ -409,7 +409,6 @@ from app.modules.proxy._service.websocket.helpers import (
     _release_websocket_response_create_gate,
     _rewrite_websocket_continuity_corruption_event,
     _rewrite_websocket_downstream_response_id,
-    _rewrite_websocket_previous_response_owner_unavailable_event,
     _rewrite_websocket_suppressed_duplicate_tool_call_completion_event,
     _sanitize_websocket_connect_failure,
     _sanitize_websocket_previous_response_error,
@@ -1217,7 +1216,8 @@ async def _process_upstream_websocket_transport_end(
     # A classified local transport failure says nothing about whether an
     # already-sent response.create was accepted. Keep it account-neutral and
     # terminal: replay here could duplicate work, billing, or tool side effects.
-    account_neutral = is_account_neutral_websocket_error_code(message_error_code)
+    frameless_transport_end = _facade()._is_account_neutral_websocket_transport_end(message)
+    account_neutral = is_account_neutral_websocket_error_code(message_error_code) or frameless_transport_end
     if account_neutral:
         if any(state.last_downstream_sequence_number is not None for state in reader_owned):
             replay_refusal_reasons.append("sequenced_downstream_frame")
@@ -5665,28 +5665,15 @@ class _WebSocketMixin:
             and not retry_safe_previous_response_not_found
             and not retry_safe_owner_replay
         ):
-            await proxy._handle_stream_error(
-                account,
-                {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
-                retry_error_code,
-            )
-            event, payload, event_type, downstream_text = _rewrite_websocket_previous_response_owner_unavailable_event(
-                request_state=request_state,
-            )
+            # The selected owner returned this terminal event. Preserve that
+            # classifier when migration is unsafe; owner-unavailable is
+            # reserved for failures to select the required owner pre-dispatch.
             retry_error_code = None
         if retry_safe_owner_replay and not retry_safe_previous_response_not_found:
             safe_request_text = _prepare_websocket_request_state_for_account_switch(request_state)
             if safe_request_text is None:
-                await proxy._handle_stream_error(
-                    account,
-                    {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
-                    retry_error_code,
-                )
-                event, payload, event_type, downstream_text = (
-                    _rewrite_websocket_previous_response_owner_unavailable_event(
-                        request_state=request_state,
-                    )
-                )
+                # Keep the original terminal event. Finalization settles usage
+                # before applying its account-health classification once.
                 retry_error_code = None
             else:
                 # Keep the global response-create gate/admission while dropping
