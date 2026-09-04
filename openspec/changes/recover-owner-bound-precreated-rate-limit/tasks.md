@@ -13,4 +13,4 @@
 
 - [x] 3.1 Add unit and endpoint regressions for recovery and exhaustion.
 - [x] 3.2 Run focused suites, lint, type checks, strict OpenSpec validation, and review.
-- [ ] 3.3 Deploy the exact tested revision and verify readiness and diagnostics.
+- [x] 3.3 Deploy the exact tested revision and verify readiness and diagnostics.
