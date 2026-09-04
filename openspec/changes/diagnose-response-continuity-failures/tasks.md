@@ -10,5 +10,5 @@
 - [x] 2.1 Add focused coverage for a mid-stream bridge drop and transient
       owner-account backoff.
 - [x] 2.2 Run focused tests, lint, type checks, and strict OpenSpec validation.
-- [ ] 2.3 Deploy the diagnostic build and verify version, revision, readiness,
+- [x] 2.3 Deploy the diagnostic build and verify version, revision, readiness,
       and emitted diagnostics.
