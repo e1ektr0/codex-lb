@@ -3691,6 +3691,16 @@ def _log_http_bridge_event(
     upstream_close_code: int | None = None,
     response_events_seen: int | None = None,
     transport_classification: str | None = None,
+    request_id: str | None = None,
+    failure_origin: str | None = None,
+    request_phase: str | None = None,
+    request_stage: str | None = None,
+    pending_total: int | None = None,
+    pending_draining: int | None = None,
+    upstream_output_seen: bool | None = None,
+    max_downstream_sequence: int | None = None,
+    account_health_action: str | None = None,
+    session_state: str | None = None,
 ) -> None:
     level = logging.INFO
     if event in {
@@ -3712,12 +3722,13 @@ def _log_http_bridge_event(
         "reader_failure",
     }:
         level = logging.WARNING
-    logger.log(
-        level,
+    message = (
         "http_bridge_event event=%s bridge_kind=%s bridge_key=%s account_id=%s"
         " model=%s pending=%s detail=%s cache_key_family=%s model_class=%s"
         " key_strength=%s owner_check_applied=%s error_message=%s upstream_close_code=%s"
-        " response_events_seen=%s transport_classification=%s",
+        " response_events_seen=%s transport_classification=%s"
+    )
+    args = (
         event,
         key.affinity_kind,
         _hash_identifier(key.affinity_key),
@@ -3734,6 +3745,25 @@ def _log_http_bridge_event(
         response_events_seen,
         transport_classification,
     )
+    if event == "reader_failure":
+        message += (
+            " request_id=%s failure_origin=%s request_phase=%s request_stage=%s"
+            " pending_total=%s pending_draining=%s upstream_output_seen=%s"
+            " max_downstream_sequence=%s account_health_action=%s session_state=%s"
+        )
+        args += (
+            request_id,
+            failure_origin,
+            request_phase,
+            request_stage,
+            pending_total,
+            pending_draining,
+            upstream_output_seen,
+            max_downstream_sequence,
+            account_health_action,
+            session_state,
+        )
+    logger.log(level, message, *args)
 
 
 def _patchable_helper(name: str, original: Callable[..., Any]) -> Callable[..., Any]:

@@ -111,6 +111,11 @@ RECENT_FOREGROUND_ACTIVITY_SECONDS = 30 * 60
 
 logger = logging.getLogger(__name__)
 
+
+def transient_error_backoff_seconds(error_count: int) -> float:
+    return float(min(300, 30 * (2 ** max(0, error_count - ERROR_BACKOFF_THRESHOLD))))
+
+
 _RELATIVE_AVAILABILITY_LOG_PREFIX_CANDIDATE = "Relative availability candidate "
 _RELATIVE_AVAILABILITY_LOG_PREFIX_TOP_K = "Relative availability top-k     "
 _RELATIVE_AVAILABILITY_LOG_PREFIX_WINNER = "Relative availability winner    "
@@ -575,7 +580,7 @@ def select_account(
         if state.cooldown_until and current < state.cooldown_until:
             continue
         if state.error_count >= ERROR_BACKOFF_THRESHOLD:
-            backoff = min(300, 30 * (2 ** (state.error_count - ERROR_BACKOFF_THRESHOLD)))
+            backoff = transient_error_backoff_seconds(state.error_count)
             if state.last_error_at and current - state.last_error_at < backoff:
                 in_error_backoff.append(state)
                 continue
@@ -612,7 +617,7 @@ def select_account(
         if allow_backoff_fallback and (len(in_error_backoff) > 1 or (in_error_backoff and hard_blocked_exists)):
 
             def _backoff_expires_at(s: AccountState) -> float:
-                backoff = min(300, 30 * (2 ** (s.error_count - ERROR_BACKOFF_THRESHOLD)))
+                backoff = transient_error_backoff_seconds(s.error_count)
                 return (s.last_error_at or 0.0) + backoff
 
             available.append(min(in_error_backoff, key=_backoff_expires_at))

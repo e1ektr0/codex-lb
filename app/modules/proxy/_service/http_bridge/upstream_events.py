@@ -1497,7 +1497,17 @@ class _HTTPBridgeUpstreamEventsMixin:
         transport_classification: str | None = None,
         retry_circuit_attempt_selection: _HTTPBridgeRetryCircuitAttemptSelection | None = None,
         account_neutral_transport_drop: bool = False,
+        failure_origin: str | None = None,
     ) -> bool:
+        session_state = (
+            "handoff"
+            if session.handoff_in_progress
+            else "quarantined"
+            if session.quarantined
+            else "already_closed"
+            if session.closed
+            else "open"
+        )
         session.closed = True
         async with session.pending_lock:
             failed_pending_count = sum(
@@ -1511,6 +1521,45 @@ class _HTTPBridgeUpstreamEventsMixin:
                 default=0,
             )
             pending_request_states = list(session.pending_requests)
+        pending_total = len(pending_request_states)
+        pending_draining = sum(
+            1 for request_state in pending_request_states if getattr(request_state, "draining_until_terminal", False)
+        )
+        request_phases = {
+            (
+                "streaming"
+                if getattr(request_state, "response_event_count", 0) > 0
+                or getattr(request_state, "upstream_model_output_seen", False)
+                or getattr(request_state, "downstream_visible", False)
+                else "awaiting_first_event"
+                if getattr(request_state, "response_create_sent_at", None) is not None
+                or getattr(request_state, "operation_dispatched", False)
+                else "queued"
+            )
+            for request_state in pending_request_states
+        }
+        request_phase = (
+            next(iter(request_phases)) if len(request_phases) == 1 else "mixed" if request_phases else "idle"
+        )
+        request_stages = {
+            getattr(request_state, "request_stage", "unknown") for request_state in pending_request_states
+        }
+        request_stage = next(iter(request_stages)) if len(request_stages) == 1 else "mixed" if request_stages else None
+        request_id = (
+            getattr(pending_request_states[0], "request_log_id", None)
+            or getattr(pending_request_states[0], "request_id", None)
+            if len(pending_request_states) == 1
+            else None
+        )
+        sequence_numbers = [
+            sequence_number
+            for request_state in pending_request_states
+            if isinstance(
+                sequence_number := getattr(request_state, "last_downstream_sequence_number", None),
+                int,
+            )
+            and not isinstance(sequence_number, bool)
+        ]
         if retry_circuit_attempt_selection is None:
             retry_circuit_attempt_selection = _http_bridge_retry_circuit_attempt_selection_for_pending_requests(
                 pending_request_states
@@ -1553,6 +1602,18 @@ class _HTTPBridgeUpstreamEventsMixin:
             ),
             cache_key_family=session.key.affinity_kind,
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            request_id=_truncate_identifier(request_id) if request_id else None,
+            failure_origin=failure_origin,
+            request_phase=request_phase,
+            request_stage=request_stage,
+            pending_total=pending_total,
+            pending_draining=pending_draining,
+            upstream_output_seen=any(
+                getattr(request_state, "upstream_model_output_seen", False) for request_state in pending_request_states
+            ),
+            max_downstream_sequence=max(sequence_numbers, default=None),
+            account_health_action="penalty_requested" if penalize_account else "neutral_requested",
+            session_state=session_state,
         )
         # Draining-only requests no longer count against the queue, but their
         # event-batcher contexts still belong to the disconnected operation
@@ -1897,6 +1958,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                                     penalize_account=False,
                                     retire_detail=_HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
                                     force_retire=True,
+                                    failure_origin="receive_timeout",
                                     retry_circuit_attempt_selection=expired_retry_circuit_attempt_selection,
                                 )
                                 break
@@ -1943,6 +2005,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                                 penalize_account=False,
                                 retire_detail=_HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
                                 force_retire=True,
+                                failure_origin="receive_timeout",
                                 retry_circuit_attempt_selection=expired_retry_circuit_attempt_selection,
                             )
                         break
@@ -1971,6 +2034,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                             session,
                             error_code=receive_timeout.error_code,
                             error_message=receive_timeout.error_message,
+                            failure_origin="receive_timeout",
                             retry_circuit_attempt_selection=retry_circuit_attempt_selection,
                         )
                     break
@@ -2058,6 +2122,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                         session,
                         error_code=message.error_code or "stream_incomplete",
                         error_message=_upstream_websocket_disconnect_message(message),
+                        failure_origin=(
+                            "upstream_close"
+                            if message.kind == "close"
+                            else "upstream_error"
+                            if message.kind == "error"
+                            else "upstream_protocol"
+                        ),
                         upstream_close_code=message.close_code,
                         response_events_seen=response_events_seen,
                         transport_classification=(
@@ -2119,6 +2190,7 @@ class _HTTPBridgeUpstreamEventsMixin:
                             if isinstance(exc, UpstreamWebSocketTransportError)
                             else "HTTP bridge upstream reader crashed before response.completed"
                         ),
+                        failure_origin="reader_exception",
                         penalize_account=not account_neutral,
                         retry_circuit_attempt_selection=reader_failure_retry_circuit_attempt_selection,
                         # Preserve ordinary crash handoff behavior, but never hand

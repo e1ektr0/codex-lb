@@ -32,6 +32,7 @@ from app.core.balancer.logic import (
     plausible_rate_limit_reset_at,
     pool_usage_exhaustion,
     select_account,
+    transient_error_backoff_seconds,
 )
 
 __all__ = [
@@ -68,4 +69,5 @@ __all__ = [
     "plausible_rate_limit_reset_at",
     "pool_usage_exhaustion",
     "select_account",
+    "transient_error_backoff_seconds",
 ]

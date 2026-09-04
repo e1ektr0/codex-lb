@@ -28049,6 +28049,7 @@ async def test_http_bridge_reader_maps_ordinary_websocket_receive_failure_to_str
     assert len(failure_calls) == 1
     assert failure_calls[0]["error_code"] == "stream_incomplete"
     assert failure_calls[0]["response_events_seen"] == 0
+    assert failure_calls[0]["failure_origin"] == "upstream_error"
     if routed:
         # Intentional flip for issue #1754: an abrupt drop with no close frame
         # and zero response events must stay account-neutral instead of
@@ -28135,6 +28136,7 @@ async def test_http_bridge_abrupt_eventless_drop_stays_account_neutral_and_recor
 @pytest.mark.asyncio
 async def test_http_bridge_abrupt_drop_after_response_events_still_penalizes_account(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A drop after the upstream already streamed response events remains
     account-attributable: only the eventless no-close-frame case is neutral."""
@@ -28149,6 +28151,9 @@ async def test_http_bridge_abrupt_drop_after_response_events_still_penalizes_acc
         transport="http",
     )
     request_state.response_event_count = 8
+    request_state.downstream_visible = True
+    request_state.last_downstream_sequence_number = 3
+    request_state.request_stage = "follow_up"
     session = _make_bridge_session(
         key_value="bridge-mid-stream-drop",
         pending_requests=deque([request_state]),
@@ -28181,12 +28186,22 @@ async def test_http_bridge_abrupt_drop_after_response_events_still_penalizes_acc
         "_record_http_bridge_account_timeout_signal",
         record_signal,
     )
+    caplog.set_level(logging.WARNING, logger="app.modules.proxy.service")
 
     await service._relay_http_bridge_upstream_messages(session)
 
     assert fail_pending.await_args is not None
     assert fail_pending.await_args.kwargs["penalize_account"] is True
     assert drop_signals == []
+    assert "failure_origin=upstream_error" in caplog.text
+    assert "request_id=req-mid-stream-drop" in caplog.text
+    assert "request_phase=streaming" in caplog.text
+    assert "request_stage=follow_up" in caplog.text
+    assert "pending_total=1" in caplog.text
+    assert "pending_draining=0" in caplog.text
+    assert "max_downstream_sequence=3" in caplog.text
+    assert "account_health_action=penalty_requested" in caplog.text
+    assert "session_state=open" in caplog.text
 
 
 @pytest.mark.asyncio

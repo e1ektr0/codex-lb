@@ -460,6 +460,7 @@ async def _settle_claimed_http_bridge_liveness_failure(
             error_message=error_message,
             penalize_account=False,
             force_retire=True,
+            failure_origin="send_liveness_timeout",
         )
 
 

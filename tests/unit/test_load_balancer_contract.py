@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import AsyncIterator, Collection
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -350,9 +352,38 @@ async def test_required_continuity_owner_miss_does_not_mark_healthy_pool_degrade
 
 
 @pytest.mark.asyncio
+async def test_required_continuity_owner_transient_backoff_is_diagnosed(
+    selection_cache: AccountSelectionCache,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    owner = _account("contract-owner-in-transient-backoff")
+    alternate = _account("contract-owner-backoff-alternate")
+    balancer, _, _, _ = _balancer([owner, alternate], selection_cache)
+    runtime = balancer._runtime.setdefault(owner.id, load_balancer_module.RuntimeState())
+    runtime.error_count = load_balancer_module.ERROR_BACKOFF_THRESHOLD
+    runtime.last_error_at = time.time()
+    caplog.set_level(logging.WARNING, logger="app.modules.proxy.load_balancer")
+
+    selection = await balancer.select_account(
+        required_account_id=owner.id,
+        required_continuity_owner=True,
+        lease_kind="stream",
+    )
+
+    assert selection.account is None
+    assert selection.error_code == load_balancer_module.CONTINUITY_OWNER_UNAVAILABLE
+    assert "Continuity owner selection unavailable" in caplog.text
+    assert f"account_id={owner.id}" in caplog.text
+    assert "reason=transient_error_backoff" in caplog.text
+    assert f"error_count={load_balancer_module.ERROR_BACKOFF_THRESHOLD}" in caplog.text
+    assert "selection_error_code=continuity_owner_unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_deleted_required_continuity_owner_returns_typed_miss_without_global_health_change(
     selection_cache: AccountSelectionCache,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     available_alternate = _account("contract-deleted-owner-alternate")
     balancer, _, _, _ = _balancer([available_alternate], selection_cache)
@@ -360,6 +391,7 @@ async def test_deleted_required_continuity_owner_returns_typed_miss_without_glob
     normal_calls: list[bool] = []
     monkeypatch.setattr(load_balancer_module, "set_degraded", degraded_reasons.append)
     monkeypatch.setattr(load_balancer_module, "set_normal", lambda: normal_calls.append(True))
+    caplog.set_level(logging.WARNING, logger="app.modules.proxy.load_balancer")
 
     selection = await balancer.select_account(
         required_account_id="contract-deleted-owner",
@@ -372,6 +404,8 @@ async def test_deleted_required_continuity_owner_returns_typed_miss_without_glob
     assert selection.error_code == load_balancer_module.CONTINUITY_OWNER_UNAVAILABLE
     assert degraded_reasons == []
     assert normal_calls == []
+    assert "Continuity owner selection unavailable" in caplog.text
+    assert "reason=missing" in caplog.text
 
 
 @pytest.mark.asyncio

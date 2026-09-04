@@ -34,6 +34,7 @@ from app.core.balancer import (
     handle_quota_exceeded,
     handle_rate_limit,
     plausible_rate_limit_reset_at,
+    transient_error_backoff_seconds,
 )
 from app.core.balancer import (
     select_account as select_account,
@@ -693,6 +694,80 @@ class LoadBalancer:
 
         selection_inputs = await load_selection_inputs()
         caps = concurrency_caps or effective_account_concurrency_caps()
+
+        def log_continuity_owner_unavailable(
+            *,
+            error_code: str | None,
+            error_message: str | None,
+            reason: str | None = None,
+        ) -> None:
+            if not required_continuity_owner or required_account_id is None:
+                return
+            current = time.time()
+            owner_account = next(
+                (
+                    account
+                    for account in selection_inputs.runtime_accounts or selection_inputs.accounts
+                    if account.id == required_account_id
+                ),
+                None,
+            )
+            owner_runtime = replace(self._runtime.get(required_account_id, RuntimeState()))
+            transient_backoff_remaining = 0.0
+            if owner_runtime.error_count >= ERROR_BACKOFF_THRESHOLD and owner_runtime.last_error_at is not None:
+                transient_backoff_remaining = max(
+                    0.0,
+                    owner_runtime.last_error_at + transient_error_backoff_seconds(owner_runtime.error_count) - current,
+                )
+            cooldown_remaining = max(0.0, (owner_runtime.cooldown_until or current) - current)
+            effective_stream_limit = effective_stream_pool_capacity(
+                candidate_account_count=1,
+                stream_limit=caps.stream_limit,
+                stream_reserve_slots=stream_reserve_slots,
+            )
+            if reason is None:
+                if owner_account is None:
+                    reason = "missing"
+                elif owner_account.status != AccountStatus.ACTIVE:
+                    reason = f"status_{owner_account.status.value}"
+                elif cooldown_remaining > 0:
+                    reason = "cooldown"
+                elif transient_backoff_remaining > 0:
+                    reason = "transient_error_backoff"
+                elif (
+                    lease_kind == "stream"
+                    and effective_stream_limit > 0
+                    and owner_runtime.inflight_streams >= effective_stream_limit
+                ):
+                    reason = "stream_cap"
+                elif (
+                    lease_kind == "response_create"
+                    and caps.response_create_limit > 0
+                    and owner_runtime.inflight_response_creates >= caps.response_create_limit
+                ):
+                    reason = "response_create_cap"
+                else:
+                    reason = "selection_policy_or_probe"
+            logger.warning(
+                "Continuity owner selection unavailable account_id=%s reason=%s status=%s health_tier=%s "
+                "error_count=%s transient_backoff_remaining_seconds=%.2f cooldown_remaining_seconds=%.2f "
+                "inflight_streams=%s stream_limit=%s inflight_response_creates=%s response_create_limit=%s "
+                "selection_error_code=%s selection_error=%s",
+                "<redacted>" if redact_sensitive_details else required_account_id,
+                reason,
+                owner_account.status.value if owner_account is not None else None,
+                owner_runtime.health_tier,
+                owner_runtime.error_count,
+                transient_backoff_remaining,
+                cooldown_remaining,
+                owner_runtime.inflight_streams,
+                effective_stream_limit,
+                owner_runtime.inflight_response_creates,
+                caps.response_create_limit,
+                error_code,
+                error_message,
+            )
+
         circuit_breaker_open = _is_upstream_circuit_breaker_open()
         if circuit_breaker_open:
             set_degraded("upstream circuit breaker is open")
@@ -707,6 +782,13 @@ class LoadBalancer:
             CONTINUITY_OWNER_UNAVAILABLE,
             CONTINUITY_OWNER_POLICY_CONFLICT,
         }:
+            log_continuity_owner_unavailable(
+                error_code=selection_inputs.error_code,
+                error_message=selection_inputs.error_message,
+                reason=(
+                    "missing" if selection_inputs.error_code == CONTINUITY_OWNER_UNAVAILABLE else "policy_conflict"
+                ),
+            )
             return AccountSelection(
                 account=None,
                 error_message=selection_inputs.error_message,
@@ -763,6 +845,11 @@ class LoadBalancer:
                         # The required owner came from a file/response/bridge index,
                         # while the raw row may be legacy turn-state ownership. Neither
                         # source can be discarded or rewritten to resolve a conflict.
+                        log_continuity_owner_unavailable(
+                            error_code="continuity_owner_conflict",
+                            error_message="Account-owned continuity sources conflict; retry the logical turn",
+                            reason="owner_conflict",
+                        )
                         return AccountSelection(
                             account=None,
                             error_message="Account-owned continuity sources conflict; retry the logical turn",
@@ -800,6 +887,11 @@ class LoadBalancer:
             and legacy_existing_account_id is None
             and len(selection_inputs.effective_continuity_owner_candidates) != 1
         ):
+            log_continuity_owner_unavailable(
+                error_code=_AMBIGUOUS_CONVERSATION_OWNER_CODE,
+                error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
+                reason="ambiguous_owner",
+            )
             return AccountSelection(
                 account=None,
                 error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
@@ -809,6 +901,11 @@ class LoadBalancer:
         # empty additional-quota pool cannot prove which account owns a
         # conversation that was ambiguous before that filter ran.
         if selection_inputs.error_code is not None and not selection_inputs.accounts:
+            log_continuity_owner_unavailable(
+                error_code=selection_inputs.error_code,
+                error_message=selection_inputs.error_message,
+                reason="selection_input_error",
+            )
             return AccountSelection(
                 account=None,
                 error_message=selection_inputs.error_message,
@@ -848,6 +945,11 @@ class LoadBalancer:
             selection_error_code = unbound_outcome.error_code
             selection_resets_at = unbound_outcome.resets_at
             if unbound_outcome.disposition == "direct_error":
+                log_continuity_owner_unavailable(
+                    error_code=selection_error_code,
+                    error_message=error_message,
+                    reason="selection_direct_error",
+                )
                 return AccountSelection(
                     account=None,
                     error_message=error_message,
@@ -923,6 +1025,11 @@ class LoadBalancer:
             selection_error_code = sticky_outcome.error_code
             selection_resets_at = sticky_outcome.resets_at
             if sticky_outcome.disposition == "direct_error":
+                log_continuity_owner_unavailable(
+                    error_code=selection_error_code,
+                    error_message=error_message,
+                    reason="selection_direct_error",
+                )
                 return AccountSelection(
                     account=None,
                     error_message=error_message,
@@ -953,6 +1060,10 @@ class LoadBalancer:
                 )
             if required_continuity_owner and selection_error_code in (None, "hard_affinity_saturated"):
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
+            log_continuity_owner_unavailable(
+                error_code=selection_error_code,
+                error_message=error_message,
+            )
             if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and error_message and selection_error_code is None:
                 return AccountSelection(
                     account=None,
