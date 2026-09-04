@@ -996,6 +996,7 @@ class _WebSocketRequestState:
     clean_close_retry_in_progress: bool = False
     clean_close_retry_result: bool | None = None
     clean_close_retry_close_generation: int | None = None
+    owner_rate_limit_retry_attempted: bool = False
     auth_replay_count: int = 0
     auth_replay_counts_by_account: dict[str, int] = field(default_factory=dict)
     force_refresh_account_id: str | None = None

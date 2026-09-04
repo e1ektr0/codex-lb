@@ -209,6 +209,7 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     is_upstream_model_capacity_error,
 )
+from app.modules.proxy.selection_errors import CONTINUITY_OWNER_RATE_LIMITED
 from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
     rewrite_parallel_tool_call_text,
@@ -959,8 +960,9 @@ async def _wait_before_http_bridge_model_capacity_retry(
     emit_keepalives: bool,
     error_message: str | None,
     cancel_when_detached: bool = False,
+    force_wait: bool = False,
 ) -> bool:
-    if request_state is None or not is_upstream_model_capacity_error(error_message):
+    if request_state is None or not (force_wait or is_upstream_model_capacity_error(error_message)):
         return True
 
     deadline = request_state.bridge_request_deadline
@@ -1056,6 +1058,45 @@ def _signal_http_bridge_capacity_startup_wait(request_state: _WebSocketRequestSt
     if request_state.capacity_startup_wait_event is not None:
         request_state.capacity_startup_wait_event.set()
     _signal_propagated_capacity_startup_wait()
+
+
+def _http_bridge_owner_bound_rate_limit_retry(
+    session: "_HTTPBridgeSession",
+    request_state: _WebSocketRequestState | None,
+    retry_error_code: str | None,
+    payload: dict[str, JsonValue] | None,
+) -> bool:
+    if retry_error_code != "rate_limit_exceeded" or request_state is None:
+        return False
+    if not _websocket_request_can_replay_before_visible_output(request_state):
+        return False
+    if _http_bridge_rate_limit_reset_exceeds_recovery_window(payload):
+        return False
+    return bool(
+        request_state.preferred_account_id == session.account.id
+        or request_state.replay_required_account_id == session.account.id
+        or request_state.operation_id is not None
+        or request_state.hard_continuity_anchor
+    )
+
+
+def _http_bridge_rate_limit_reset_exceeds_recovery_window(
+    payload: dict[str, JsonValue] | None,
+) -> bool:
+    error_payload = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error_payload, dict) and isinstance(payload, dict):
+        response = payload.get("response")
+        error_payload = response.get("error") if isinstance(response, dict) else None
+    if isinstance(error_payload, dict):
+        resets_in = error_payload.get("resets_in_seconds")
+        if isinstance(resets_in, int | float) and not isinstance(resets_in, bool):
+            if float(resets_in) > _ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS:
+                return True
+        resets_at = error_payload.get("resets_at")
+        if isinstance(resets_at, int | float) and not isinstance(resets_at, bool):
+            if float(resets_at) - time.time() > _ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS:
+                return True
+    return False
 
 
 def _archive_http_bridge_upstream_text(
@@ -2485,7 +2526,15 @@ class _HTTPBridgeUpstreamEventsMixin:
                     and early_retry_error_code is not None
                     and early_retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
                     and not is_previous_response_not_found_event
-                    and is_upstream_model_capacity_error(error_message)
+                    and (
+                        is_upstream_model_capacity_error(error_message)
+                        or _http_bridge_owner_bound_rate_limit_retry(
+                            session,
+                            matched_request_state,
+                            early_retry_error_code,
+                            payload,
+                        )
+                    )
                     and _websocket_request_can_replay_before_visible_output(matched_request_state)
                 )
                 if reserve_terminal_for_model_capacity_retry:
@@ -2934,7 +2983,14 @@ class _HTTPBridgeUpstreamEventsMixin:
             and not is_previous_response_not_found_event
             and status_request_state is not None
             and is_upstream_model_capacity_error(retry_error_message)
+            and not _http_bridge_rate_limit_reset_exceeds_recovery_window(payload)
             and _websocket_request_can_replay_before_visible_output(status_request_state)
+        )
+        wait_for_owner_rate_limit_retry = _http_bridge_owner_bound_rate_limit_retry(
+            session,
+            status_request_state,
+            retry_error_code,
+            payload,
         )
         if (
             auth_error_code is not None
@@ -2967,7 +3023,11 @@ class _HTTPBridgeUpstreamEventsMixin:
                         payload,
                         event_type,
                     ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
-        elif wait_for_model_capacity_retry and status_request_state is not None and retry_error_code is not None:
+        elif (
+            (wait_for_model_capacity_retry or wait_for_owner_rate_limit_retry)
+            and status_request_state is not None
+            and retry_error_code is not None
+        ):
             # Reserve the terminal request again before any await so a younger
             # submit cannot claim its queue slot while account health is being
             # updated. A concurrent detach will mark this state as draining.
@@ -3001,11 +3061,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                 ):
                     await _release_http_bridge_model_capacity_retry_admission(status_request_state)
                     status_request_state.awaiting_response_created = True
+                capacity_wait_kwargs = {"force_wait": True} if wait_for_owner_rate_limit_retry else {}
                 retry_after_wait = await _wait_before_http_bridge_model_capacity_retry(
                     status_request_state,
                     emit_keepalives=not status_request_state.propagate_http_errors,
                     error_message=retry_error_message,
                     cancel_when_detached=True,
+                    **capacity_wait_kwargs,
                 )
                 if wait_request_had_event_queue and status_request_state.event_queue is None:
                     retry_after_wait = False
@@ -3013,9 +3075,13 @@ class _HTTPBridgeUpstreamEventsMixin:
                     status_request_state.account_capacity_wait_suppress_keepalive
                 )
                 try:
+                    precreated_retry_kwargs = (
+                        {"require_same_account_retry": True} if wait_for_owner_rate_limit_retry else {}
+                    )
                     retried = retry_after_wait and await self._retry_http_bridge_precreated_request(
                         session,
                         request_state=status_request_state,
+                        **precreated_retry_kwargs,
                     )
                     if retried:
                         _signal_http_bridge_model_capacity_retry_ready(
@@ -3032,7 +3098,28 @@ class _HTTPBridgeUpstreamEventsMixin:
                         session.pending_requests.remove(status_request_state)
                         if _http_bridge_request_counts_against_queue(status_request_state):
                             session.queued_request_count = max(0, session.queued_request_count - 1)
-                if retry_after_wait or not status_request_state.propagate_http_errors:
+                        status_request_state.terminal_settlement_phase = "claimed"
+                        if status_request_state not in claimed_terminal_request_states:
+                            claimed_terminal_request_states.append(status_request_state)
+                if wait_for_owner_rate_limit_retry:
+                    if status_request_state.error_code_override is None:
+                        status_request_state.error_http_status_override = 429
+                        status_request_state.error_code_override = CONTINUITY_OWNER_RATE_LIMITED
+                        status_request_state.error_message_override = (
+                            "Continuity owner account is temporarily rate-limited; retry later."
+                        )
+                        status_request_state.error_type_override = "rate_limit_error"
+                    (
+                        event_block,
+                        payload,
+                        event,
+                        event_type,
+                    ) = _normalize_http_bridge_error_event(
+                        event=event,
+                        payload=payload,
+                        request_state=status_request_state,
+                    )
+                elif retry_after_wait or not status_request_state.propagate_http_errors:
                     status_request_state.error_http_status_override = 502
                     (
                         _downstream_text,
@@ -3201,6 +3288,37 @@ class _HTTPBridgeUpstreamEventsMixin:
                     payload,
                     event_type,
                 ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
+        elif (
+            status_request_state is not None
+            and status_request_state.owner_rate_limit_retry_attempted
+            and _normalize_error_code(
+                _websocket_event_error_code(event_type, payload),
+                _websocket_event_error_type(event_type, payload),
+            )
+            == "rate_limit_exceeded"
+        ):
+            await self._handle_or_defer_precreated_stream_health(
+                status_request_state,
+                session.account,
+                {"message": retry_error_message or "Upstream error"},
+                "rate_limit_exceeded",
+            )
+            status_request_state.error_http_status_override = 429
+            status_request_state.error_code_override = CONTINUITY_OWNER_RATE_LIMITED
+            status_request_state.error_message_override = (
+                "Continuity owner account is temporarily rate-limited; retry later."
+            )
+            status_request_state.error_type_override = "rate_limit_error"
+            (
+                event_block,
+                payload,
+                event,
+                event_type,
+            ) = _normalize_http_bridge_error_event(
+                event=event,
+                payload=payload,
+                request_state=status_request_state,
+            )
 
         completed_usage = (
             event.response.usage if event_type == "response.completed" and event and event.response else None

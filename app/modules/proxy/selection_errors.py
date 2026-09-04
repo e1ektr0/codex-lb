@@ -6,6 +6,7 @@ from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.resilience.overload import is_local_overload_error_code
 
 USAGE_LIMIT_REACHED = "usage_limit_reached"
+CONTINUITY_OWNER_RATE_LIMITED = "continuity_owner_rate_limited"
 
 
 class SelectionFailure(Protocol):
@@ -33,6 +34,16 @@ def selection_failure_response(selection: SelectionFailure) -> tuple[int, OpenAI
                 code,
                 message,
                 error_type=USAGE_LIMIT_REACHED,
+                resets_at=selection.resets_at,
+            ),
+        )
+    if code == CONTINUITY_OWNER_RATE_LIMITED:
+        return (
+            429,
+            openai_error(
+                code,
+                message,
+                error_type="rate_limit_error",
                 resets_at=selection.resets_at,
             ),
         )

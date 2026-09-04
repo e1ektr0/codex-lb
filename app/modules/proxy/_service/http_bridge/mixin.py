@@ -222,7 +222,11 @@ from app.modules.proxy.continuity import (
 )
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 from app.modules.proxy.load_balancer import CONTINUITY_OWNER_UNAVAILABLE, AccountLease
-from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
+from app.modules.proxy.selection_errors import (
+    CONTINUITY_OWNER_RATE_LIMITED,
+    USAGE_LIMIT_REACHED,
+    selection_failure_response,
+)
 
 logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
@@ -2158,7 +2162,9 @@ class _HTTPBridgeMixin(
                     service_tier=session.request_service_tier,
                     exclude_account_ids=excluded_account_ids,
                     preferred_account_id=preferred_candidate_id,
-                    preferred_account_is_continuity_owner=account_neutral_recovery,
+                    preferred_account_is_continuity_owner=(
+                        account_neutral_recovery or request_state.owner_rate_limit_retry_attempted
+                    ),
                     require_security_work_authorized=require_security_work_authorized,
                     lease_kind=None if reuse_current_account_lease else "stream",
                     estimated_lease_tokens=_estimated_lease_tokens_from_request_usage_budget(
@@ -2183,6 +2189,10 @@ class _HTTPBridgeMixin(
                 if account_neutral_recovery and selection.error_code == CONTINUITY_OWNER_UNAVAILABLE:
                     complete_failed_handoff()
                     raise _http_bridge_previous_response_owner_unavailable_error()
+                if selection.error_code == CONTINUITY_OWNER_RATE_LIMITED:
+                    status_code, error_payload = selection_failure_response(selection)
+                    complete_failed_handoff()
+                    raise ProxyResponseError(status_code, error_payload)
                 if (
                     reuse_current_account_lease
                     and not hard_close_account_bound

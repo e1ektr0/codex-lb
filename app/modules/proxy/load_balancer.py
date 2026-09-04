@@ -147,6 +147,7 @@ from app.modules.proxy.fair_share import (
     evaluate_stream_fair_share,
 )
 from app.modules.proxy.repo_bundle import ProxyRepoFactory, ProxyRepositories
+from app.modules.proxy.selection_errors import CONTINUITY_OWNER_RATE_LIMITED
 from app.modules.quota_planner.logic import PlannerSettings
 from app.modules.usage.additional_quota_keys import (
     canonicalize_additional_quota_key,
@@ -1058,8 +1059,25 @@ class LoadBalancer:
                     error_message=error_message,
                     error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
                 )
+            required_owner_account = (
+                next(
+                    (
+                        account
+                        for account in selection_inputs.runtime_accounts or selection_inputs.accounts
+                        if account.id == required_account_id
+                    ),
+                    None,
+                )
+                if required_continuity_owner and required_account_id is not None
+                else None
+            )
             if required_continuity_owner and selection_error_code in (None, "hard_affinity_saturated"):
-                selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
+                if required_owner_account is not None and required_owner_account.status == AccountStatus.RATE_LIMITED:
+                    selection_error_code = CONTINUITY_OWNER_RATE_LIMITED
+                    error_message = "Continuity owner account is temporarily rate-limited; retry later."
+                    selection_resets_at = required_owner_account.reset_at
+                else:
+                    selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
             log_continuity_owner_unavailable(
                 error_code=selection_error_code,
                 error_message=error_message,

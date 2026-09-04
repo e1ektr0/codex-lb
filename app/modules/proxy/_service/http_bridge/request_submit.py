@@ -3327,6 +3327,7 @@ class _HTTPBridgeRequestSubmitMixin:
         *,
         request_state: _WebSocketRequestState | None = None,
         restart_reader: bool = False,
+        require_same_account_retry: bool = False,
     ) -> bool:
         clean_close_retry_max_count = self._http_bridge_clean_close_retry_max_count()
         account_neutral_recovery = is_http_bridge_account_neutral_replay(
@@ -3357,6 +3358,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 or request_state.replay_count != 1
                 or request_state.response_event_count != 0
                 or request_state.clean_close_replay_count >= clean_close_retry_max_count
+                or request_state.owner_rate_limit_retry_attempted
                 or _classify_upstream_close(
                     session.last_upstream_close_code,
                     response_events_seen=request_state.response_event_count,
@@ -3468,13 +3470,17 @@ class _HTTPBridgeRequestSubmitMixin:
                 and request_state.replay_count == 1
                 and request_state.response_event_count == 0
                 and request_state.clean_close_replay_count < clean_close_retry_max_count
+                and not request_state.owner_rate_limit_retry_attempted
             )
             if request_state.replay_count >= 1 and not additional_clean_close_retry:
                 return False
             account_bound_replay = False
             if request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
-                if account_neutral_recovery:
+                if require_same_account_retry:
+                    request_state.preferred_account_id = session.account.id
+                    switch_text = None
+                elif account_neutral_recovery:
                     request_state.preferred_account_id = session.account.id
                     switch_text = None
                 else:
@@ -3592,7 +3598,16 @@ class _HTTPBridgeRequestSubmitMixin:
             # below acquires a lease for the account actually selected.
             if fresh_hard_request_account_switch_allowed:
                 await self._release_request_state_account_response_create_lease(request_state)
-            if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
+            if require_same_account_retry:
+                request_state.owner_rate_limit_retry_attempted = True
+                await self._reconnect_http_bridge_session(
+                    session,
+                    request_state=request_state,
+                    require_same_account=True,
+                    require_preferred_account=True,
+                    **reconnect_reader_kwargs,
+                )
+            elif hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,

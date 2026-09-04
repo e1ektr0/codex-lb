@@ -708,6 +708,29 @@ class _RateLimitErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _TransientRateLimitErrorUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 429,
+                        "error": {
+                            "type": "rate_limit_error",
+                            "code": "rate_limit_exceeded",
+                            "message": "Rate limit reached for requests per minute",
+                            "plan_type": "team",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _PreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     async def send_text(self, text: str) -> None:
         self.sent_text.append(text)
@@ -9531,17 +9554,42 @@ async def test_v1_responses_http_bridge_retries_unanchored_request_when_upstream
     assert silent_upstream.sent_text == recovered_upstream.sent_text
 
 
+@pytest.mark.parametrize(
+    "upstream_type",
+    [_PrecreatedOverloadUpstreamWebSocket, _TransientRateLimitErrorUpstreamWebSocket],
+)
 @pytest.mark.asyncio
-async def test_backend_responses_http_bridge_retries_precreated_server_overload(async_client, monkeypatch):
+async def test_backend_responses_http_bridge_retries_precreated_capacity_error(
+    async_client,
+    monkeypatch,
+    upstream_type,
+):
     _install_bridge_settings(monkeypatch, enabled=True)
+    monkeypatch.setattr(
+        http_bridge_upstream_events_module,
+        "_ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS",
+        0.001,
+    )
+    monkeypatch.setattr(
+        http_bridge_upstream_events_module,
+        "_ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS",
+        0.001,
+    )
     account_id = await _import_account(
         async_client,
         "acc_http_bridge_server_overload",
         "http-bridge-server-overload@example.com",
     )
     account = await _get_account(account_id)
-    upstreams = [_PrecreatedOverloadUpstreamWebSocket(), _FakeBridgeUpstreamWebSocket()]
+    await _import_account(
+        async_client,
+        "acc_http_bridge_server_overload_alternate",
+        "http-bridge-server-overload-alternate@example.com",
+    )
+    upstreams = [upstream_type(), _FakeBridgeUpstreamWebSocket()]
     connect_count = 0
+    preferred_account_ids: list[str | None] = []
+    connected_account_ids: list[str | None] = []
 
     async def fake_select_account_with_budget(
         self,
@@ -9562,7 +9610,7 @@ async def test_backend_responses_http_bridge_retries_precreated_server_overload(
         api_key=None,
         preferred_account_id=None,
     ):
-        del preferred_account_id
+        preferred_account_ids.append(preferred_account_id)
         del (
             self,
             deadline,
@@ -9594,8 +9642,9 @@ async def test_backend_responses_http_bridge_retries_precreated_server_overload(
         base_url=None,
         session=None,
     ):
-        del headers, access_token, account_id_header, base_url, session
+        del headers, access_token, base_url, session
         nonlocal connect_count
+        connected_account_ids.append(account_id_header)
         upstream = upstreams[connect_count]
         connect_count += 1
         return upstream
@@ -9623,6 +9672,8 @@ async def test_backend_responses_http_bridge_retries_precreated_server_overload(
     _assert_created_text_delta_completed(events)
     assert events[-1]["response"]["id"] == "resp_bridge_1"
     assert connect_count == 2
+    if upstream_type is _TransientRateLimitErrorUpstreamWebSocket:
+        assert connected_account_ids == [account.chatgpt_account_id, account.chatgpt_account_id]
 
 
 @pytest.mark.asyncio

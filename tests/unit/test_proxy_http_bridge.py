@@ -5118,6 +5118,7 @@ async def test_http_bridge_model_capacity_waits_before_retrying_safe_injected_an
         retry_session: proxy_service._HTTPBridgeSession,
         *,
         request_state: proxy_service._WebSocketRequestState | None = None,
+        require_same_account_retry: bool = False,
     ) -> bool:
         assert retry_session is session
         assert request_state is not None
@@ -5152,6 +5153,271 @@ async def test_http_bridge_model_capacity_waits_before_retrying_safe_injected_an
     assert call_order == ["wait", "retry"]
     assert list(session.pending_requests) == [request_state]
     assert session.queued_request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_owner_bound_rate_limit_waits_before_same_owner_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-owner-rate-limit-wait",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        bridge_request_deadline=time.monotonic() + 60.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        transport="http",
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        operation_id="op-owner-rate-limit-wait",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-owner-rate-limit-wait",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    request_state.preferred_account_id = session.account.id
+    call_order: list[str] = []
+
+    async def wait_before_retry(*args: object, **kwargs: object) -> bool:
+        assert args == (request_state,)
+        assert kwargs == {
+            "emit_keepalives": True,
+            "error_message": "Rate limit reached for requests per minute",
+            "cancel_when_detached": True,
+            "force_wait": True,
+        }
+        call_order.append("wait")
+        return True
+
+    async def retry_precreated(
+        retry_session: proxy_service._HTTPBridgeSession,
+        *,
+        request_state: proxy_service._WebSocketRequestState | None = None,
+        require_same_account_retry: bool = False,
+    ) -> bool:
+        assert retry_session is session
+        assert request_state is not None
+        assert request_state.preferred_account_id == session.account.id
+        assert require_same_account_retry is True
+        assert call_order == ["wait"]
+        call_order.append("retry")
+        return True
+
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(
+        http_bridge_upstream_events_module,
+        "_wait_before_http_bridge_model_capacity_retry",
+        wait_before_retry,
+    )
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 429,
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded",
+                    "message": "Rate limit reached for requests per minute",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    assert call_order == ["wait", "retry"]
+    assert list(session.pending_requests) == [request_state]
+    assert session.queued_request_count == 1
+
+
+def test_http_bridge_owner_bound_long_window_rate_limit_does_not_wait() -> None:
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-owner-long-rate-limit",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        operation_id="op-owner-long-rate-limit",
+    )
+    session = _make_bridge_session(key_value="bridge-owner-long-rate-limit")
+    request_state.preferred_account_id = session.account.id
+
+    assert (
+        http_bridge_upstream_events_module._http_bridge_owner_bound_rate_limit_retry(
+            session,
+            request_state,
+            "rate_limit_exceeded",
+            {
+                "type": "error",
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "resets_in_seconds": 3600,
+                },
+            },
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("wait_result", "retry_failure_code", "expected_status", "expected_code", "expected_type"),
+    [
+        (False, None, 429, "continuity_owner_rate_limited", "rate_limit_error"),
+        (True, "previous_response_owner_unavailable", 502, "previous_response_owner_unavailable", "server_error"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_http_bridge_owner_rate_limit_recovery_preserves_typed_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    wait_result: bool,
+    retry_failure_code: str | None,
+    expected_status: int,
+    expected_code: str,
+    expected_type: str,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-owner-rate-limit-exhausted",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        bridge_request_deadline=time.monotonic() + 60.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        transport="http",
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        operation_id="op-owner-rate-limit-exhausted",
+    )
+    session = _make_bridge_session(
+        key_value="bridge-owner-rate-limit-exhausted",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    request_state.preferred_account_id = session.account.id
+
+    async def retry_precreated(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        if retry_failure_code is not None:
+            request_state.error_http_status_override = 502
+            request_state.error_code_override = retry_failure_code
+            request_state.error_message_override = "Previous response owner account is unavailable; retry later."
+            request_state.error_type_override = "server_error"
+        return False
+
+    retry_precreated_mock = AsyncMock(side_effect=retry_precreated)
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated_mock)
+    monkeypatch.setattr(
+        http_bridge_upstream_events_module,
+        "_wait_before_http_bridge_model_capacity_retry",
+        AsyncMock(return_value=wait_result),
+    )
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 429,
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded",
+                    "message": "Rate limit reached for requests per minute",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    assert request_state.event_queue is not None
+    terminal_block = await request_state.event_queue.get()
+    assert terminal_block is not None
+    terminal = proxy_service.parse_sse_data_json(terminal_block)
+    assert isinstance(terminal, dict)
+    assert terminal["type"] == "response.failed"
+    response = terminal["response"]
+    assert isinstance(response, dict)
+    error = response["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == expected_code
+    assert error["type"] == expected_type
+    assert request_state.error_http_status_override == expected_status
+    if wait_result:
+        retry_precreated_mock.assert_awaited_once()
+    else:
+        retry_precreated_mock.assert_not_awaited()
+    assert await request_state.event_queue.get() is None
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_second_owner_rate_limit_returns_typed_429_without_third_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-owner-second-rate-limit",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        transport="http",
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        operation_id="op-owner-second-rate-limit",
+        replay_count=1,
+        owner_rate_limit_retry_attempted=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-owner-second-rate-limit",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    retry_precreated = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 429,
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded",
+                    "message": "Rate limit reached for requests per minute",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    retry_precreated.assert_not_awaited()
+    assert request_state.event_queue is not None
+    terminal_block = await request_state.event_queue.get()
+    assert terminal_block is not None
+    terminal = proxy_service.parse_sse_data_json(terminal_block)
+    assert isinstance(terminal, dict)
+    response = terminal["response"]
+    assert isinstance(response, dict)
+    error = response["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "continuity_owner_rate_limited"
+    assert error["type"] == "rate_limit_error"
+    assert await request_state.event_queue.get() is None
 
 
 @pytest.mark.asyncio
@@ -10251,7 +10517,7 @@ async def test_reconnect_http_bridge_session_skips_capacity_wait_for_usage_limit
 
 
 @pytest.mark.asyncio
-async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usage_limit(
+async def test_reconnect_http_bridge_session_preserves_owner_rate_limit_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
@@ -10262,11 +10528,14 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
         routing_strategy="usage_weighted",
     )
 
-    async def select_account(_deadline: float, **_kwargs: object) -> proxy_service.AccountSelection:
+    selection_kwargs: list[dict[str, object]] = []
+
+    async def select_account(_deadline: float, **kwargs: object) -> proxy_service.AccountSelection:
+        selection_kwargs.append(kwargs)
         return proxy_service.AccountSelection(
             account=None,
             error_message="Rate limit exceeded. Try again in 1h",
-            error_code="usage_limit_reached",
+            error_code="continuity_owner_rate_limited",
             resets_at=1_700_003_600,
         )
 
@@ -10278,6 +10547,7 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
         api_key_reservation=None,
         started_at=100.0,
         preferred_account_id=session.account.id,
+        owner_rate_limit_retry_attempted=True,
     )
     monkeypatch.setattr(proxy_service.time, "monotonic", lambda: 100.5)
     monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
@@ -10300,9 +10570,11 @@ async def test_reconnect_http_bridge_session_preserves_owner_error_for_owner_usa
             require_preferred_account=True,
         )
 
-    assert exc_info.value.status_code == 502
-    assert exc_info.value.payload["error"]["code"] == "previous_response_owner_unavailable"
-    assert exc_info.value.payload["error"]["type"] == "server_error"
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.payload["error"]["code"] == "continuity_owner_rate_limited"
+    assert exc_info.value.payload["error"]["type"] == "rate_limit_error"
+    assert exc_info.value.payload["error"]["resets_at"] == 1_700_003_600
+    assert selection_kwargs[0]["preferred_account_is_continuity_owner"] is True
 
 
 @pytest.mark.asyncio
@@ -27226,6 +27498,39 @@ async def test_retry_http_bridge_precreated_request_consumes_each_clean_close_on
     assert request_state.clean_close_replay_count == 1
     assert request_state.clean_close_retry_close_generation == 7
     assert send_text.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_owner_rate_limit_retry_does_not_enable_extra_clean_close_send(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-owner-rate-limit-clean-close",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        awaiting_response_created=True,
+        request_text='{"type":"response.create","model":"gpt-5.4","input":"hello"}',
+        transport="http",
+        replay_count=1,
+        owner_rate_limit_retry_attempted=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-owner-rate-limit-clean-close",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.last_upstream_close_code = 1000
+    session.last_upstream_close_generation = 8
+    send_text = AsyncMock()
+    session.upstream = cast(UpstreamWebSocket, SimpleNamespace(send_text=send_text, close=AsyncMock()))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+
+    assert await service._retry_http_bridge_precreated_request(session) is False
+    send_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio

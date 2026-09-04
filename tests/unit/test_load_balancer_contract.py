@@ -352,6 +352,28 @@ async def test_required_continuity_owner_miss_does_not_mark_healthy_pool_degrade
 
 
 @pytest.mark.asyncio
+async def test_required_rate_limited_continuity_owner_returns_typed_rate_limit(
+    selection_cache: AccountSelectionCache,
+) -> None:
+    owner = _account("contract-rate-limited-owner")
+    owner.status = AccountStatus.RATE_LIMITED
+    owner.reset_at = int(time.time()) + 30
+    alternate = _account("contract-rate-limited-owner-alternate")
+    balancer, _, _, _ = _balancer([owner, alternate], selection_cache)
+
+    selection = await balancer.select_account(
+        required_account_id=owner.id,
+        required_continuity_owner=True,
+        lease_kind="stream",
+    )
+
+    assert selection.account is None
+    assert selection.error_code == "continuity_owner_rate_limited"
+    assert selection.error_message == "Continuity owner account is temporarily rate-limited; retry later."
+    assert selection.resets_at == owner.reset_at
+
+
+@pytest.mark.asyncio
 async def test_required_continuity_owner_transient_backoff_is_diagnosed(
     selection_cache: AccountSelectionCache,
     caplog: pytest.LogCaptureFixture,
