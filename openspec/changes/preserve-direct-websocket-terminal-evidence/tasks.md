@@ -12,4 +12,4 @@
 ## 3. Validation
 
 - [x] 3.1 Run focused and broad tests, lint, type checks, strict OpenSpec validation, and review.
-- [ ] 3.2 Deploy the exact tested revision and verify diagnostics and readiness.
+- [x] 3.2 Deploy the exact tested revision and verify diagnostics and readiness.
