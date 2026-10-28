@@ -199,9 +199,9 @@ async def test_responses_preserves_encrypted_output_and_replay(
                     event["item"] for event in events if event.get("type") == event_type
                 ] == encrypted_output_items()
             completed = next(event["response"] for event in events if event.get("type") == "response.completed")
-        # Native SSE retains upstream's empty terminal; item events carry output.
+        # This deployment baseline retains native empty terminals, including collected JSON.
         expected = (
-            [] if path.startswith("/backend-api/") and stream and not terminal_output else encrypted_output_items()
+            [] if path.startswith("/backend-api/") and not terminal_output else encrypted_output_items()
         )
         assert completed["output"] == expected
         assert seen[-1]["include"] == include
