@@ -31,17 +31,6 @@ from app.core.types import JsonValue
 from tests.unit.hypothesis_strategies import json_arrays, json_directive_types, json_objects, json_values
 
 
-@pytest.mark.parametrize("request_type", [ResponsesRequest, V1ResponsesRequest])
-def test_encrypted_output_include_survives_native_and_public_serialization(request_type):
-    include = ["reasoning.encrypted_content", "output.encrypted_content"]
-    request = request_type.model_validate(
-        {"model": "gpt-5.1", "instructions": "", "input": "hello", "include": include}
-    )
-    if isinstance(request, V1ResponsesRequest):
-        request = request.to_responses_request()
-    assert request.to_payload()["include"] == include
-
-
 def test_responses_requires_instructions():
     with pytest.raises(ValidationError):
         ResponsesRequest.model_validate({"model": "gpt-5.1", "input": []})

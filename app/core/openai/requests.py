@@ -22,7 +22,6 @@ _RESPONSES_INCLUDE_ALLOWLIST = {
     "message.input_image.image_url",
     "message.output_text.logprobs",
     "reasoning.encrypted_content",
-    "output.encrypted_content",
     "web_search_call.action.sources",
 }
 
